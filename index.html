@@ -1,0 +1,177 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><meta name="theme-color" content="#2f5bc4"><title>Mode7craft</title><link rel="preload" href="g.wasm" as="fetch" type="application/wasm" crossorigin><style>
+html,body{margin:0;height:100%;overflow:hidden;background:#2f5bc4;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+#c{position:fixed;inset:0;width:100%;height:100%;display:block;image-rendering:pixelated}
+#h{position:fixed;left:50%;bottom:calc(8px + env(safe-area-inset-bottom));transform:translateX(-50%);background:rgba(18,22,38,.6);color:#fff3b0;font:700 10px/1 ui-monospace,Menlo,Consolas,monospace;letter-spacing:1px;text-transform:uppercase;padding:6px 10px;white-space:nowrap;max-width:94vw;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+#e,#l{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;color:#fff3b0;font:700 14px/1.5 ui-monospace,Menlo,monospace;background:#2f5bc4}
+#e{display:none;z-index:9}
+#t{display:none}
+#b{display:none;position:fixed;width:110px;height:110px;margin:-55px 0 0 -55px;border-radius:50%;background:rgba(18,22,38,.28);border:2px solid rgba(255,243,176,.5);pointer-events:none}
+#k{position:absolute;left:30px;top:30px;width:50px;height:50px;border-radius:50%;background:rgba(255,243,176,.65)}
+.bt{position:fixed;right:calc(18px + env(safe-area-inset-right));width:64px;height:64px;border-radius:50%;background:rgba(18,22,38,.45);border:2px solid rgba(255,243,176,.6);color:#fff3b0;font:700 13px ui-monospace,monospace;display:flex;align-items:center;justify-content:center}
+#j{bottom:calc(46px + env(safe-area-inset-bottom))}#v{bottom:calc(124px + env(safe-area-inset-bottom));width:48px;height:48px;right:calc(26px + env(safe-area-inset-right));font-size:11px}
+</style></head><body><canvas id="c"></canvas><div id="l">LOADING</div><div id="e"></div><div id="h"></div><div id="t"><div id="b"><div id="k"></div></div><div class="bt" id="j" data-btn="1">JUMP</div><div class="bt" id="v" data-btn="1">VIEW</div></div><script type="module">
+const SCENE_WGSL=`struct V{@builtin(position)p:vec4f};@vertex fn vs(@builtin(vertex_index)i:u32)->V{var o:V;let x=f32((i<<1u)&2u);let y=f32(i&2u);o.p=vec4f(x*2.-1.,1.-y*2.,0.,1.);return o;}@group(0)@binding(0)var<uniform>U:array<vec4f,8>;@group(0)@binding(1)var vox:texture_3d<u32>;@group(0)@binding(2)var hm:texture_2d<u32>;const N=128;const NZ=16;const S=8.;const ZW=2.75;const CB=15.5;const SUN=vec3f(-0.5,0.42,0.757);const FOG=vec3f(0.761,0.859,0.941);fn hh(a:u32)->u32{var n=a;n^=n >> 16u;n*=0x7feb352du;n^=n >> 15u;n*=0x846ca68bu;n^=n >> 16u;return n;}fn h2(p:vec2i)->f32{return f32(hh((u32(p.x)*1597334677u)^hh(u32(p.y)+0x9e3779b9u)) >> 8u)/16777216.;}fn h3(p:vec3i)->f32{return h2(vec2i(p.x+p.z*7919,p.y^(p.z*104729)));}fn c3(h:u32)->vec3f{return vec3f(f32((h >> 16u)&255u),f32((h >> 8u)&255u),f32(h&255u))/255.;}fn block(b:vec3i)->u32{if(b.x<0||b.y<0||b.z<0||b.x>=N||b.y>=N||b.z>=NZ){return 0u;}return textureLoad(vox,b,0).r;}fn height(b:vec2i)->i32{if(b.x<0||b.y<0||b.x>=N||b.y>=N){return 0;}return i32(textureLoad(hm,b,0).r);}fn player(t:vec3i)->u32{let P=U[5];let dz=t.z-i32(floor(P.z*S+0.01));if(dz<0||dz>14){return 0u;}let d=vec2f(t.xy)+0.5-P.xy*S;if(dot(d,d)>20.){return 0u;}let f=U[6].xy;let v=dot(d,f);let u=dot(d,vec2f(f.y,-f.x));let iu=i32(floor(u+0.5));let iv=i32(floor(v+0.5));let sw=i32(round(sin(U[6].z)*1.6*U[6].w));if(dz<=4){let m=select(10u,15u,dz==0);if((iu==-1||iu==-2)&&(iv-sw==-1||iv-sw==0)){return m;}if((iu==0||iu==1)&&(iv+sw==-1||iv+sw==0)){return m;}return 0u;}if(dz<=9){if(iu>=-2&&iu<=1&&(iv==-1||iv==0)){return 11u;}if(dz>=5&&((iu==-3&&(iv+sw==-1||iv+sw==0))||(iu==2&&(iv-sw==-1||iv-sw==0)))){return select(11u,12u,dz==5);}return 0u;}if(iu>=-2&&iu<=1&&iv>=-2&&iv<=1){if(dz>=13||iv==-2||(dz==12&&(iu==-2||iu==1)&&iv<1)){return 13u;}if(iv==1&&dz==11&&(iu==-2||iu==1)){return 14u;}return 12u;}return 0u;}fn solidT(t:vec3i)->u32{let pm=player(t);if(pm!=0u){return pm;}let id=block(t >> vec3u(3u));if(id==5u){let l=t&vec3i(7);if(l.x<2||l.x>5||l.y<2||l.y>5){return 0u;}}if(id==6u&&h3(t)<0.06){return 0u;}return id;}fn vn(p:vec2f)->f32{let i=vec2i(floor(p));let f=fract(p);let u=f*f*(3.-2.*f);return mix(mix(h2(i),h2(i+vec2i(1,0)),u.x),mix(h2(i+vec2i(0,1)),h2(i+vec2i(1,1)),u.x),u.y);}fn cloud(p:vec2f)->f32{let w=p+vec2f(U[0].z*0.9,U[0].z*0.3);let c=vec2i(floor(w/12.));if(h2(c+vec2i(77,13))>0.42){return 0.;}var hmax=0.;for(var i=0;i<4;i++){let r1=h2(c*4+vec2i(i,91));let r2=h2(c*4+vec2i(i,37));let r3=h2(c*4+vec2i(i,53));let r=1.3+r3*2.2;let o=vec2f(c)*12.+6.+(vec2f(r1,r2)-.5)*(9.-2.*r);let d=w-o;let q=r*r-dot(d,d);if(q>0.){hmax=max(hmax,sqrt(q)*2.6+0.5);}}return hmax;}fn shadow(q0:vec3f)->f32{var q=q0;var s=1.;for(var j=0;j<30;j++){q+=SUN*(1.6/S);if(q.z>15.){break;}if(solidT(vec3i(floor(q*S)))!=0u){s=0.;break;}}let qc=q0.xy+SUN.xy*((CB+0.6-q0.z)/SUN.z);if(cloud((floor(qc*S)+.5)/S)>0.){s=min(s,0.);}return s;}fn grassCol(hb:f32)->vec3f{switch i32(hb){case 4:{return c3(0x8fd24au);}case 5:{return c3(0x78c438u);}case 6:{return c3(0x66b232u);}case 7:{return c3(0x549f2cu);}default:{return c3(0x448c27u);}}}fn matCol(id:u32,t:vec3i,face:i32)->vec3f{let r=h3(t);let l=t&vec3i(7);let b=t >> vec3u(3u);var c:vec3f;switch id{case 1u:{let g=grassCol(f32(b.z+1));if(face==0){c=g*(0.94+0.1*h2(b.xy));if(r<0.09){c*=0.78;}else if(r>0.96){c*=1.12;}}else{let edge=7-l.z<2+i32(h3(vec3i(t.xy,0))*2.5);c=select(c3(0x8a5a34u)*select(1.,0.82,r<.2),g*0.8,edge);}}case 2u:{c=c3(0x8a5a34u)*select(1.,0.8,r<.25);}case 3u:{c=c3(0xd6c983u)*select(1.,0.92,r<.2);if(face!=0){c*=0.9;}}case 4u:{c=c3(0x959e9eu)*select(1.,0.86,r<.3);if(r>.95){c*=1.1;}}case 5u:{c=select(c3(0x7a5230u)*select(1.,0.8,l.x==3||l.y==4),c3(0xb08a55u),face==0);}case 6u:{c=c3(0x307026u)*select(1.,select(0.78,1.25,r>.5),r<.2||r>.9);}case 10u:{c=c3(0x2b3a8cu);}case 11u:{c=c3(0x3fa9c9u);}case 12u:{c=c3(0xe0a878u);}case 13u:{c=c3(0x4a3020u);}case 14u:{c=c3(0x1a1a2au);}default:{c=c3(0x2a2a2au);}}return c;}fn water(p:vec2f,sh:f32)->vec3f{let t=vec2i(floor(p*S));let tm=U[0].z;let hb=height(t >> vec2u(3u));var dl=9;for(var k=1;k<=3;k++){if(height((t+vec2i(k,0)) >> vec2u(3u))>=3||height((t-vec2i(k,0)) >> vec2u(3u))>=3||height((t+vec2i(0,k)) >> vec2u(3u))>=3||height((t-vec2i(0,k)) >> vec2u(3u))>=3){dl=min(dl,k);}}let n=h2(t >> vec2u(1u))*0.6;let dep=(2.7-f32(hb))+n-select(0.,1.2,dl<=3);var c=c3(0x2f5bc4u);if(dep<1.0){c=c3(0x59c2c4u);}else if(dep<1.9){c=c3(0x3f8ad6u);}let wt=vec2i(floor(vec2f(p.x*S+tm*3.,p.y*S)/vec2f(3.,1.)));let sp=h2(wt+vec2i(i32(tm*0.8)*37,0));if(sp>0.985){c=vec3f(0.95,0.98,1.);}else if(sp>0.965){c=mix(c,vec3f(0.62,0.8,1.),0.7);}if(sh<0.5){c=mix(c,c3(0x1b2f78u),0.55);}let ph=i32(tm*3.);if(dl==1&&h2(t+vec2i(ph*13,0))>0.15){c=vec3f(0.96,0.98,1.);}else if(dl==2&&h2(t+vec2i(0,ph*7))>0.6){c=mix(c,vec3f(1.),0.8);}return c;}fn sky(d:vec3f)->vec3f{return mix(FOG,vec3f(0.55,0.72,0.92),clamp(d.z*3.,0.,1.));}@fragment fn fs(@builtin(position)fc:vec4f)->@location(0)vec4f{let res=U[0].xy;let uv=fc.xy/res*2.-1.;let nd=vec2f(uv.x*U[3].w,-uv.y)*U[0].w;let o=U[1].xyz;let d=normalize(U[2].xyz+U[3].xyz*nd.x+U[4].xyz*nd.y);let far=U[2].w;let fogOn=U[1].w;if(d.z>-0.002){return vec4f(sky(d),1.);}for(var k=0;k<10;k++){let j=9-k;let z=CB+f32(j+1)/S;let t=(z-o.z)/d.z;if(t<0.){continue;}if(t>far){break;}let q=(floor((o.xy+d.xy*t)*S)+.5)/S;let qi=vec2i(floor(fc.xy));if(length(q-U[5].xy)<5.&&((qi.x+qi.y)&1)==0){continue;}let th=cloud(q);if(th>f32(j)){var c=vec3f(1.);if(th>=f32(j+1)&&j<9){c=select(select(vec3f(0.97,0.98,1.),vec3f(0.86,0.9,0.96),j<4),vec3f(0.73,0.8,0.91),j<2);}else if(h2(vec2i(floor(q*S)))>0.9){c=vec3f(0.94,0.96,1.);}return vec4f(mix(c,FOG,fogOn*smoothstep(far*0.4,far,t)),1.);}}var hit=0u;var ht=vec3i(0);var hp=vec3f(0.);var face=0;var prev=vec3i(-9999);var tt=0.;for(var k=NZ*8-1;k>=22;k--){let t=(f32(k+1)/S-o.z)/d.z;if(t<0.){continue;}if(t>far){break;}let p=o+d*t;if(p.x<-1.||p.y<-1.||p.x>f32(N)+1.||p.y>f32(N)+1.){prev=vec3i(-9999);continue;}let tx=vec3i(vec2i(floor(p.xy*S)),k);let m=solidT(tx);if(m!=0u){hit=m;ht=tx;hp=p;tt=t;if(solidT(tx+vec3i(0,0,1))==0u){face=0;}else if(prev.x!=tx.x&&(prev.y==tx.y||abs(d.x)>abs(d.y))){face=1;}else{face=2;}break;}prev=tx;}var col:vec3f;if(hit==0u){let t=(ZW-o.z)/d.z;if(t>far){return vec4f(sky(d),1.);}tt=t;let p=o+d*t;col=water(p.xy,shadow(vec3f((floor(p.xy*S)+.5)/S,ZW)));}else{col=matCol(hit,ht,face);var q=(vec3f(ht)+vec3f(.5,.5,1.02))/S;var lit=1.;if(face==0){let l=ht&vec3i(7);let b=ht >> vec3u(3u);if(hit<5u){if((l.x==0&&block(b+vec3i(-1,0,1))!=0u)||(l.x==7&&block(b+vec3i(1,0,1))!=0u)||(l.y==0&&block(b+vec3i(0,-1,1))!=0u)||(l.y==7&&block(b+vec3i(0,1,1))!=0u)){col*=0.72;}if((l.x==7&&block(b+vec3i(1,0,0))==0u)||(l.y==0&&block(b+vec3i(0,-1,0))==0u)){lit=0.86;}if((l.x==0&&block(b-vec3i(1,0,0))==0u)||(l.y==7&&block(b+vec3i(0,1,0))==0u)){lit=1.12;}}}else{let nrm=select(vec2f(0.,-sign(d.y)),vec2f(-sign(d.x),0.),face==1);q=(vec3f(ht)+.5)/S+vec3f(nrm*0.7/S,0.);lit=select(0.66,0.9,dot(nrm,SUN.xy)>0.);}let sh=shadow(q);col*=lit;if(sh<0.5){col*=vec3f(0.58,0.64,0.8);}}col=mix(col,FOG,fogOn*smoothstep(far*0.35,far,tt));return vec4f(col,1.);}`;const BLIT_WGSL=`@group(0)@binding(0)var src:texture_2d<f32>;@group(0)@binding(1)var<uniform>B:vec4f;struct V{@builtin(position)p:vec4f};@vertex fn vs(@builtin(vertex_index)i:u32)->V{var o:V;let x=f32((i<<1u)&2u);let y=f32(i&2u);o.p=vec4f(x*2.-1.,1.-y*2.,0.,1.);return o;}@fragment fn fs(@builtin(position)fc:vec4f)->@location(0)vec4f{return textureLoad(src,vec2i(fc.xy/B.x),0);}`;
+
+const $ = (s) => document.querySelector(s);
+const cv = $('#c'), hint = $('#h');
+const fail = (m) => { $('#e').textContent = m; $('#e').style.display = 'flex'; };
+const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: Math.sin, mcos: Math.cos, msqrt: Math.sqrt } });
+(async () => {
+if (!navigator.gpu) return fail('WebGPU is not available in this browser. Try Chrome/Edge 113+, Safari 26+ (iOS 26), or enable WebGPU in your browser flags.');
+const ad = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+if (!ad) return fail('WebGPU is supported but no GPU adapter was found.');
+const dev = await ad.requestDevice();
+dev.addEventListener('uncapturederror', (e) => console.error(e.error.message));
+dev.lost.then((i) => fail('GPU device lost: ' + i.message));
+const { instance } = await wasmP; const X = instance.exports;
+X.gen(1337);
+const mem = () => X.memory.buffer;
+const N = 128, NZ = 16;
+const ctx = cv.getContext('webgpu'), fmt = navigator.gpu.getPreferredCanvasFormat();
+ctx.configure({ device: dev, format: fmt, alphaMode: 'opaque' });
+const T = GPUTextureUsage;
+const vox = dev.createTexture({ size: [N, N, NZ], dimension: '3d', format: 'r8uint', usage: T.TEXTURE_BINDING | T.COPY_DST });
+const hm = dev.createTexture({ size: [N, N], format: 'r8uint', usage: T.TEXTURE_BINDING | T.COPY_DST });
+const upload = () => {
+dev.queue.writeTexture({ texture: vox }, new Uint8Array(mem(), X.world_ptr(), N * N * NZ), { bytesPerRow: N, rowsPerImage: N }, [N, N, NZ]);
+dev.queue.writeTexture({ texture: hm }, new Uint8Array(mem(), X.height_ptr(), N * N), { bytesPerRow: N }, [N, N]);
+};
+upload();
+const ub = dev.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const bb = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const mk = (code, f) => { const m = dev.createShaderModule({ code }); m.getCompilationInfo?.().then((i) => i.messages.forEach((x) => console.warn(x.type, x.lineNum, x.message))); return dev.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: 'fs', targets: [{ format: f }] } }); };
+const scene = mk(SCENE_WGSL, 'rgba8unorm'), blit = mk(BLIT_WGSL, fmt);
+let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = 115000;
+const resize = () => {
+const d = Math.min(devicePixelRatio || 1, 3);
+W = Math.max(1, Math.round(innerWidth * d)); H = Math.max(1, Math.round(innerHeight * d));
+cv.width = W; cv.height = H;
+px = Math.max(1, Math.round(Math.sqrt(W * H / AREA)));
+iw = Math.ceil(W / px); ih = Math.ceil(H / px);
+rt?.destroy();
+rt = dev.createTexture({ size: [iw, ih], format: 'rgba8unorm', usage: T.RENDER_ATTACHMENT | T.TEXTURE_BINDING });
+sg = dev.createBindGroup({ layout: scene.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ub } }, { binding: 1, resource: vox.createView() }, { binding: 2, resource: hm.createView() }] });
+bg = dev.createBindGroup({ layout: blit.getBindGroupLayout(0), entries: [{ binding: 0, resource: rt.createView() }, { binding: 1, resource: { buffer: bb } }] });
+dev.queue.writeBuffer(bb, 0, new Float32Array([px, 0, 0, 0]));
+};
+addEventListener('resize', resize); resize();
+const VIEWS = [{ pitch: 0.62, tan: 0.27, dist: 30, fog: 1 }, { pitch: 1.2, tan: 0.13, dist: 105, fog: 0 }];
+const qs = new URLSearchParams(location.search);
+let view = +qs.get('v') & 1, yaw = Math.PI / 2 + (+qs.get('r') || 0), pitch = VIEWS[view].pitch, zoom = +qs.get('z') || 1, cz = 0, mode = 'kb', run = false;
+const keys = new Set();
+const setMode = (m) => { if (m === mode) return; mode = m; hint.textContent = HINTS[m]; $('#t').style.display = m === 'touch' ? 'block' : 'none'; };
+const HINTS = {
+kb: 'WASD move \u00b7 click + mouse to look \u00b7 Q/E turn \u00b7 wheel zoom \u00b7 space jump \u00b7 shift run \u00b7 V view',
+pad: 'L-stick move \u00b7 R-stick look \u00b7 A jump \u00b7 B run \u00b7 Y view \u00b7 LT/RT zoom \u00b7 LB/RB turn',
+touch: 'left: move \u00b7 drag right: look \u00b7 pinch: zoom',
+};
+hint.textContent = HINTS.kb;
+const toggleView = () => { view ^= 1; pitch = VIEWS[view].pitch; };
+let jumpQ = false;
+addEventListener('keydown', (e) => { setMode('kb'); keys.add(e.code); if (e.code === 'KeyV' && !e.repeat) toggleView(); if (e.code === 'Space') { jumpQ = true; e.preventDefault(); } });
+addEventListener('keyup', (e) => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+const look = (dx, dy) => { yaw -= dx; pitch = Math.min(1.45, Math.max(0.3, pitch + dy)); };
+cv.addEventListener('mousedown', () => { setMode('kb'); if (document.pointerLockElement !== cv) cv.requestPointerLock?.(); });
+addEventListener('mousemove', (e) => { if (document.pointerLockElement === cv || e.buttons) look(e.movementX * 0.004, e.movementY * 0.003); });
+addEventListener('wheel', (e) => { zoom = Math.min(2.6, Math.max(0.45, zoom * Math.exp(e.deltaY * 0.001))); e.preventDefault(); }, { passive: false });
+const stick = { id: null, ox: 0, oy: 0, x: 0, y: 0 }, looks = new Map(); let pinch = 0;
+const knob = $('#k'), base = $('#b');
+const tstart = (e) => {
+setMode('touch');
+for (const t of e.changedTouches) {
+if (t.target.dataset.btn) continue;
+if (t.clientX < innerWidth * 0.45 && stick.id === null) {
+Object.assign(stick, { id: t.identifier, ox: t.clientX, oy: t.clientY, x: 0, y: 0 });
+base.style.cssText = `display:block;left:${t.clientX}px;top:${t.clientY}px`; knob.style.transform = '';
+} else looks.set(t.identifier, { x: t.clientX, y: t.clientY });
+}
+e.preventDefault();
+};
+const tmove = (e) => {
+for (const t of e.changedTouches) {
+if (t.identifier === stick.id) {
+let dx = t.clientX - stick.ox, dy = t.clientY - stick.oy; const l = Math.hypot(dx, dy), R = 50;
+if (l > R) { dx *= R / l; dy *= R / l; }
+stick.x = dx / R; stick.y = -dy / R; knob.style.transform = `translate(${dx}px,${dy}px)`;
+} else if (looks.has(t.identifier)) {
+const p = looks.get(t.identifier);
+if (looks.size === 1) look((t.clientX - p.x) * 0.008, (t.clientY - p.y) * 0.006);
+p.x = t.clientX; p.y = t.clientY;
+}
+}
+if (looks.size === 2) {
+const [a, b] = [...looks.values()]; const d = Math.hypot(a.x - b.x, a.y - b.y);
+if (pinch) zoom = Math.min(2.6, Math.max(0.45, zoom * pinch / d)); pinch = d;
+} else pinch = 0;
+e.preventDefault();
+};
+const tend = (e) => {
+for (const t of e.changedTouches) {
+if (t.identifier === stick.id) { stick.id = null; stick.x = stick.y = 0; base.style.display = 'none'; }
+looks.delete(t.identifier);
+}
+pinch = 0;
+};
+cv.addEventListener('touchstart', tstart, { passive: false });
+addEventListener('touchmove', tmove, { passive: false });
+addEventListener('touchend', tend); addEventListener('touchcancel', tend);
+$('#j').addEventListener('touchstart', (e) => { jumpQ = true; e.preventDefault(); }, { passive: false });
+$('#v').addEventListener('touchstart', (e) => { toggleView(); e.preventDefault(); }, { passive: false });
+if (matchMedia('(pointer: coarse)').matches) setMode('touch');
+const prevBtn = [];
+const dz = (v) => (Math.abs(v) < 0.15 ? 0 : (v - Math.sign(v) * 0.15) / 0.85);
+const U = new Float32Array(32), st = new Float32Array(mem(), X.state_ptr(), 16);
+let last = performance.now(), acc = 0, frames = 0, slow = 0;
+cz = st[2];
+const frame = (now) => {
+const dt = Math.min(0.05, (now - last) / 1000); last = now;
+let mx = 0, my = 0, jump = jumpQ; jumpQ = false;
+run = keys.has('ShiftLeft') || keys.has('ShiftRight');
+mx += (keys.has('KeyD') || keys.has('ArrowRight') ? 1 : 0) - (keys.has('KeyA') || keys.has('ArrowLeft') ? 1 : 0);
+my += (keys.has('KeyW') || keys.has('ArrowUp') ? 1 : 0) - (keys.has('KeyS') || keys.has('ArrowDown') ? 1 : 0);
+if (keys.has('KeyQ')) yaw += 2.2 * dt; if (keys.has('KeyE')) yaw -= 2.2 * dt;
+if (keys.has('KeyR')) look(0, -1.2 * dt); if (keys.has('KeyF')) look(0, 1.2 * dt);
+if (keys.has('Equal') || keys.has('NumpadAdd')) zoom = Math.max(0.45, zoom * (1 - dt)); if (keys.has('Minus') || keys.has('NumpadSubtract')) zoom = Math.min(2.6, zoom * (1 + dt));
+for (const g of navigator.getGamepads?.() || []) {
+if (!g || !g.connected) continue;
+const a = g.axes, b = (i) => g.buttons[i]?.pressed, v = (i) => g.buttons[i]?.value || 0;
+const lx = dz(a[0] || 0), ly = dz(a[1] || 0), rx = dz(a[2] || 0), ry = dz(a[3] || 0);
+if (lx || ly || rx || ry || g.buttons.some((x) => x.pressed)) setMode('pad');
+mx += lx; my -= ly; look(rx * 2.6 * dt, ry * 1.6 * dt);
+if (b(0) && !prevBtn[0]) jump = true;
+if (b(3) && !prevBtn[3]) toggleView();
+if (b(4) && !prevBtn[4]) yaw += Math.PI / 4; if (b(5) && !prevBtn[5]) yaw -= Math.PI / 4;
+if (b(1) || b(10)) run = true;
+zoom = Math.min(2.6, Math.max(0.45, zoom * (1 + (v(6) - v(7)) * dt * 1.5)));
+for (let i = 0; i < 16; i++) prevBtn[i] = b(i);
+break;
+}
+mx += stick.x; my += stick.y;
+if (Math.hypot(stick.x, stick.y) > 0.95) run = true;
+X.step(dt, mx, my, yaw, (jump ? 1 : 0) | (run ? 2 : 0));
+const s = st.length ? st : new Float32Array(mem(), X.state_ptr(), 16);
+cz += (s[2] - cz) * Math.min(1, dt * 10);
+const V = VIEWS[view], dist = V.dist * zoom;
+const cp = Math.cos(pitch), sp = Math.sin(pitch), fx = Math.cos(yaw), fy = Math.sin(yaw);
+const F = [fx * cp, fy * cp, -sp], R = [fy, -fx, 0], Up = [R[1] * F[2] - R[2] * F[1], R[2] * F[0] - R[0] * F[2], R[0] * F[1] - R[1] * F[0]];
+const tx = s[0], ty = s[1], tz = cz + 0.9;
+const tanV = V.tan * Math.max(1, (ih / iw) * 0.8);
+U.set([iw, ih, now / 1000, tanV, tx - F[0] * dist, ty - F[1] * dist, tz - F[2] * dist, V.fog,
+...F, V.fog ? dist * 3.2 : dist * 6, ...R, iw / ih, ...Up, 0, s[0], s[1], s[2], 0, s[4], s[5], s[6], s[7]]);
+dev.queue.writeBuffer(ub, 0, U);
+const enc = dev.createCommandEncoder();
+let p = enc.beginRenderPass({ colorAttachments: [{ view: rt.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] });
+p.setPipeline(scene); p.setBindGroup(0, sg); p.draw(3); p.end();
+p = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] });
+p.setPipeline(blit); p.setBindGroup(0, bg); p.draw(3); p.end();
+dev.queue.submit([enc.finish()]);
+acc += dt; frames++;
+if (acc > 1) { if (acc / frames > 0.022 && AREA > 45000) { if (++slow >= 2) { AREA *= 0.75; resize(); slow = 0; } } else slow = 0; acc = 0; frames = 0; }
+requestAnimationFrame(frame);
+};
+$('#l').remove();
+requestAnimationFrame(frame);
+})().catch((e) => fail('Failed to start: ' + e.message));
+
+</script></body></html>
