@@ -6,9 +6,10 @@ struct V { @builtin(position) p: vec4f };
   var o: V; let x = f32((i << 1u) & 2u); let y = f32(i & 2u);
   o.p = vec4f(x * 2. - 1., 1. - y * 2., 0., 1.); return o;
 }
-@group(0) @binding(0) var<uniform> U: array<vec4f, 20>;
+@group(0) @binding(0) var<uniform> U: array<vec4f, 20>;   // U[9].z = torch count
 @group(0) @binding(1) var vox: texture_3d<u32>;
 @group(0) @binding(2) var hm: texture_2d<u32>;
+@group(0) @binding(3) var<uniform> TL: array<vec4f, 32>;   // nearest torches: xyz + flicker (own buffer: keeps U small)
 
 const N = 128; const NZ = 16; const S = 8.; const ZW = 2.75; const CB = 15.5; 
 const TR = 0.34; // trunk radius
@@ -130,7 +131,7 @@ fn traceBlocks(ro: vec3f, rd: vec3f, tA: f32, tB: f32, steps: i32) -> Hit {
         let t1 = (-b - sqrt(disc)) / a;
         if (t1 >= t - 1e-4 && t1 <= tx) { h.t = t1; h.id = 5u; h.n = vec3f(normalize(ro.xy + rd.xy * t1 - cc), 0.); return h; }
       }
-    } else if (id != 0u) { h.t = t; h.id = id; h.n = n; return h; }
+    } else if (id != 0u && id != 8u) { h.t = t; h.id = id; h.n = n; return h; }   // torches: drawn from the light list
     if (tm.x < tm.y && tm.x < tm.z) { t = tm.x; tm.x += dl.x; c.x += st.x; n = vec3f(f32(-st.x), 0., 0.); }
     else if (tm.y < tm.z) { t = tm.y; tm.y += dl.y; c.y += st.y; n = vec3f(0., f32(-st.y), 0.); }
     else { t = tm.z; tm.z += dl.z; c.z += st.z; n = vec3f(0., 0., f32(-st.z)); }
@@ -193,6 +194,11 @@ fn matCol(id: u32, t: vec3i, face: i32) -> vec3f {
       let vv = select(l.z, l.y, face == 0); let uu = select(l.x, l.y, face == 1); let row = (vv >> 2u) + b.z * 2;
       c = c3(0xb8915au) * (0.93 + 0.1 * h2(vec2i(row, b.x * 7 + b.y)));
       if ((vv & 3) == 3 || uu == ((row * 5 + b.x + b.y) & 7)) { c *= 0.72; } else if (r < .12) { c *= 0.9; }
+    }
+    case 8u: {
+      // torch: dark-grained stick, 2-texel flame on top that flickers
+      c = select(c3(0x7a5230u), c3(0x5c3c22u), ((l.x + l.z) & 1) == 1);
+      if (l.z >= 5) { let f = h3(vec3i(l.x, l.y, l.z + i32(U[0].z * 12.))); c = select(select(c3(0xff9a2eu), c3(0xffd65cu), f > 0.45), c3(0xfff3c0u), l.z == 6 && f > 0.75); }
     }
     case 10u: { c = c3(0x2b3a8cu); }
     case 11u: { c = c3(0x3fa9c9u); }
@@ -304,6 +310,12 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
       if (r.x <= r.y && r.x > 0. && r.x < hb.t) { hb.t = r.x; hb.id = u32(U[9].x); hb.n = pn; part = true; }
     }
   }
+  // torches: a 2x2-texel stick + flame box per listed torch (analytic, outside the DDA hot loop)
+  for (var i = 0; i < i32(U[9].z); i++) {
+    var tn = vec3f(0.); let b0 = floor(TL[i].xyz) + vec3f(0.375, 0.375, 0.);
+    let r = slab(o, sinv(d), d, b0, b0 + vec3f(0.25, 0.25, 0.8125), &tn);
+    if (r.x <= r.y && r.x > 0. && r.x < hb.t) { hb.t = r.x; hb.id = 8u; hb.n = tn; part = false; }
+  }
   var col: vec3f; var tt = hb.t;
   if (hb.id == 0u && ca > 0.5 && ct < tw) { if (HQ) { return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
   if (hb.id == 0u) {
@@ -312,14 +324,14 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
       tt = tw;
       let p = o + d * tw;
       if (HQ) { col = hqWater(p, d); }
-      else { col = water(p.xy, shadow(vec3f((floor(p.xy * S) + .5) / S, ZW))); }
+      else { col = water(p.xy, shadow(vec3f((floor(p.xy * S) + .5) / S, ZW))); if (U[9].z > 0.) { col += col * torchL(p, vec3f(0., 0., 1.), false) * 0.6; } }
     }
   } else {
     let p = o + d * hb.t; let n = hb.n;
     let ht = vec3i(floor((p - n * 0.002) * S));          // texel inside the hit voxel, robust on faces
     let face = select(select(2, 1, abs(n.x) > 0.5), 0, n.z > 0.5);
     let isLog = hb.id == 5u && !part;
-    col = select(matCol(hb.id, ht, face), birch(p, n), isLog);
+    col = select(matCol(hb.id, ht, face), birch(p, n), isLog); let base0 = col;
     var lit = 1.;
     if (HQ) { col = hqShade(p, n, ht, hb.id, isLog, part, col); }
     else if (isLog) {
@@ -345,6 +357,8 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
       col *= lit;
       if (shadow(q) < 0.5) { col *= vec3f(0.58, 0.64, 0.8); }
     }
+    if (!HQ && U[9].z > 0.) { col += base0 * torchL(p + n * 0.03, n, false) * 0.8; }
+    if (hb.id == 8u && !part && (ht.z & 7) >= 5) { col = select(base0, lin(base0) * 4., HQ); }   // flame: emissive
     // targeted block: pixel-crisp dark outline on its edges + light face tint
     if (U[8].w > 0.5 && !part && hb.id < 10u) {
       let cell = vec3i(floor(p - n * 0.002));
@@ -361,13 +375,25 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
   return vec4f(col, 1.);
 }
 
+// warm point lights from the nearest torches (list filled by JS). HQ adds an occlusion ray.
+fn torchL(p: vec3f, n: vec3f, occl: bool) -> vec3f {
+  var s = 0.;
+  for (var i = 0; i < i32(U[9].z); i++) {
+    let L = TL[i]; let v = L.xyz - p; let d2 = dot(v, v);
+    if (d2 > 64.) { continue; }
+    let d = sqrt(d2); let a = 1. - d / 8.; var k = a * a * L.w * (0.3 + 0.7 * max(dot(n, v / d), 0.));
+    if (occl && k > 0.004) { let o = traceBlocks(p, v / d, 0., d, 16).id; if (o != 0u && o != 8u) { k = 0.; } }
+    s += k;
+  }
+  return vec3f(1., 0.56, 0.24) * s;
+}
 // ======================= HQ lighting (only reachable when HQ = true) =======================
 // Linear-ish HDR: palette colours are squared (gamma 2), lit by sun + sky + one bounce,
 // tonemapped (ACES fit) and square-rooted again in hq.wgsl. Sun: U[18] dir, U[19] colour,
 // U[7].yzw sky ambient. All lookups stay on the voxel grid so it keeps the pixel-art look.
 fn lin(c: vec3f) -> vec3f { return c * c; }
 fn sunL() -> vec3f { return U[18].xyz; }
-fn occ(b: vec3i) -> f32 { let i = block(b); return select(0., 1., i != 0u && i != 5u); }
+fn occ(b: vec3i) -> f32 { let i = block(b); return select(0., 1., i != 0u && i != 5u && i != 8u); }
 // Minecraft-style per-voxel AO: the 8 cells around the face's air cell, bilinear over the face
 fn hqAO(c: vec3i, n: vec3f, p: vec3f) -> f32 {
   let a = c + vec3i(round(n));
@@ -382,6 +408,31 @@ fn hqAO(c: vec3i, n: vec3f, p: vec3f) -> f32 {
   let c11 = 3. - select(xp + yp + occ(a + u + v), 3., xp + yp > 1.5);
   return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y) / 3.;
 }
+// sun transmittance along a ray: leaves pass light through texel gaps (dappled light), logs are
+// round, torches let light by, anything else is opaque
+fn hqTrans(ro: vec3f, rd: vec3f, steps: i32) -> f32 {
+  let inv = sinv(rd); var n = vec3f(0.);
+  let w = slab(ro, inv, rd, vec3f(0.), vec3f(f32(N), f32(N), f32(NZ)), &n);
+  var t = max(0., w.x); if (t >= w.y) { return 1.; }
+  let st = select(vec3i(-1), vec3i(1), rd > vec3f(0.)); let dl = abs(inv);
+  var c = clamp(vec3i(floor(ro + rd * (t + 1e-4))), vec3i(0), vec3i(N - 1, N - 1, NZ - 1));
+  var tm = (vec3f(c) + select(vec3f(0.), vec3f(1.), rd > vec3f(0.)) - ro) * inv; var T = 1.;
+  for (var i = 0; i < steps; i++) {
+    let id = block(c); let tx = min(min(tm.x, tm.y), tm.z);
+    if (id == 6u) {
+      T *= select(0.12, 0.8, h3(vec3i(floor((ro + rd * (t + tx) * 0.5) * S))) < 0.4);
+      if (T < 0.02) { return 0.; }
+    } else if (id == 5u) {
+      let oc = ro.xy - (vec2f(c.xy) + .5); let a = max(dot(rd.xy, rd.xy), 1e-9);
+      if (length(oc + rd.xy * clamp(-dot(oc, rd.xy) / a, t, tx)) < TR) { return 0.; }
+    } else if (id != 0u && id != 8u) { return 0.; }
+    if (tm.x < tm.y && tm.x < tm.z) { t = tm.x; tm.x += dl.x; c.x += st.x; }
+    else if (tm.y < tm.z) { t = tm.y; tm.y += dl.y; c.y += st.y; }
+    else { t = tm.z; tm.z += dl.z; c.z += st.z; }
+    if (t > w.y || any(c < vec3i(0)) || c.x >= N || c.y >= N || c.z >= NZ) { break; }
+  }
+  return T;
+}
 // soft sun shadow: 3 rays in a small cone (rotated per texel), so it is sharp at contact and
 // widens with blocker distance; clouds cast a translucent shadow
 fn hqShadow(p: vec3f, k: f32) -> f32 {
@@ -389,7 +440,7 @@ fn hqShadow(p: vec3f, k: f32) -> f32 {
   let t1 = normalize(cross(L, vec3f(0., 0., 1.))); let t2 = cross(L, t1); var v = 0.;
   for (var i = 0; i < 3; i++) {
     let a = (f32(i) + k) * 2.0944; let r = normalize(L + (t1 * cos(a) + t2 * sin(a)) * 0.075);
-    if (traceBlocks(p, r, 0., 16., 28).id == 0u && tracePlayer(p, r, 16.).id == 0u) { v += 1.; }
+    if (tracePlayer(p, r, 16.).id == 0u) { v += hqTrans(p, r, 28); }
   }
   let qc = p.xy + L.xy * ((CB + 0.6 - p.z) / L.z);
   return v / 3. * select(1., 0.3, cloud((floor(qc * S) + .5) / S) > 0.);
@@ -418,7 +469,15 @@ fn hqShade(p: vec3f, n: vec3f, ht: vec3i, id: u32, isLog: bool, part: bool, base
   var g = block(c + vec3i(round(n)) - vec3i(0, 0, 1));
   if (g == 0u) { g = block(c + vec3i(round(n)) - vec3i(0, 0, 2)); }
   let gc = select(lin(matCol(g, vec3i(4), 0)), vec3f(0.06, 0.2, 0.45), g == 0u);
-  return hqLight(lin(base), n, ao, sh, gc * 0.6);
+  var c2 = hqLight(lin(base), n, ao, sh, gc * 0.6);
+  let q = p + n * 0.03;
+  if (id == 6u && dot(n, sunL()) <= 0. && sunL().z > 0.02) {
+    // backlit leaves: sun transmitted through the crown, strongest looking towards the sun
+    let mu = max(dot(normalize(p - U[1].xyz), sunL()), 0.);
+    c2 += lin(base) * U[19].xyz * hqTrans(q, sunL(), 12) * (0.12 + pow(mu, 4.));
+  }
+  if (U[9].z > 0.) { c2 += lin(base) * torchL(q, n, true) * 1.5; }
+  return c2;
 }
 fn hqWater(p: vec3f, d: vec3f) -> vec3f {
   let tq = (floor(p.xy * S) + .5) / S; let tm = U[0].z;
@@ -435,6 +494,7 @@ fn hqWater(p: vec3f, d: vec3f) -> vec3f {
   }
   let fr = 0.03 + 0.6 * pow(1. - abs(d.z), 5.);
   var c = mix(base * (U[7].yzw * 0.9 + U[19].xyz * (0.2 + 0.25 * sh)), rc, fr);
+  if (U[9].z > 0.) { c += base * torchL(p, vec3f(0., 0., 1.), false) * 1.5; }
   return c + U[19].xyz * pow(max(dot(r, sunL()), 0.), 900.) * 8. * sh;   // sun glint
 }
 fn hqCloud(cc: vec3f, t: f32, o: vec3f, d: vec3f) -> vec3f {
@@ -445,15 +505,16 @@ fn hqCloud(cc: vec3f, t: f32, o: vec3f, d: vec3f) -> vec3f {
 // shadow (and terrain under the sample), in-scatter ~ sun phase; distance fades into the sky
 fn hqAtmo(o: vec3f, d: vec3f, tt: f32, far: f32, fogOn: f32, col: vec3f, fc: vec2f) -> vec3f {
   let L = sunL(); let len = min(tt, 56.); let j = bayer4(vec2i(floor(fc)));
-  var vis = 0.;
+  var vis = 0.; let ph = 0.05 + 3. * pow(max(dot(d, L), 0.), 6.);
   for (var k = 0; k < 6; k++) {
     let q = o + d * (len * (f32(k) + j) / 6.);
-    let qc = q.xy + L.xy * ((CB + 0.6 - q.z) / max(L.z, 0.05));
-    let lit = q.z > f32(height(vec2i(floor(q.xy)))) && (q.z > CB || cloud((floor(qc * S) + .5) / S) <= 0.);
-    vis += select(0., 1., lit);
+    let qc = q.xy + L.xy * ((CB + 0.6 - q.z) / max(L.z, 0.05)); let hq = f32(height(vec2i(floor(q.xy))));
+    let lit = q.z > hq && (q.z > CB || cloud((floor(qc * S) + .5) / S) <= 0.);
+    if (lit) { vis += select(1., hqTrans(q, L, 8), ph > 0.4 && q.z < hq + 7.); }   // crown gaps (near the ground, towards the sun)
   }
-  let ph = 0.35 + 2.2 * pow(max(dot(d, L), 0.), 8.);
+  // in-scatter: strongly forward (shafts show when looking towards the sun), denser near the
+  // ground so crown gaps throw visible rays even over a few blocks
   let dens = 1. - exp(-len * 0.006);
-  var c = col + U[19].xyz * (vis / 6.) * ph * dens * 0.06 + U[7].yzw * dens * 0.02;
+  var c = col + U[19].xyz * (vis / 6.) * ph * (1. - exp(-len * 0.03)) * 0.12 + U[7].yzw * dens * 0.02;
   return mix(c, hqSky(d), fogOn * smoothstep(far * 0.35, far, tt));
 }

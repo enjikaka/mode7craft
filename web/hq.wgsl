@@ -26,6 +26,10 @@ fn aces(x: vec3f) -> vec3f { return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x
   let uv = (vec2f(ip) + .5) / ds; let o = 6. / ds; var b = textureSampleLevel(blm, sm, uv, 0.).rgb * 2.;
   b += textureSampleLevel(blm, sm, uv + vec2f(o.x, o.y), 0.).rgb + textureSampleLevel(blm, sm, uv - vec2f(o.x, o.y), 0.).rgb;
   b += textureSampleLevel(blm, sm, uv + vec2f(o.x, -o.y), 0.).rgb + textureSampleLevel(blm, sm, uv - vec2f(o.x, -o.y), 0.).rgb;
+  let q = o * 1.2;   // + axis taps: round glow instead of an X
+  b += textureSampleLevel(blm, sm, uv + vec2f(q.x, 0.), 0.).rgb + textureSampleLevel(blm, sm, uv - vec2f(q.x, 0.), 0.).rgb;
+  b += textureSampleLevel(blm, sm, uv + vec2f(0., q.y), 0.).rgb + textureSampleLevel(blm, sm, uv - vec2f(0., q.y), 0.).rgb;
+  b *= 0.6;
   // hue-preserving ACES on the max channel keeps the saturated palette; very hot pixels go white
   c = (c + b * 0.5) * 0.85; let m = max(max(c.r, c.g), max(c.b, 1e-4)); let tm = aces(vec3f(m)).x;
   c = sqrt(mix(c * (tm / m), vec3f(tm), smoothstep(1., 6., m)));

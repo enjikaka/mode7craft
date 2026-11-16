@@ -20,6 +20,7 @@ const cmd = (method: string, params: any = {}) => new Promise<any>((r) => { cons
 await cmd('Runtime.enable'); await cmd('Network.enable'); await cmd('Network.setCacheDisabled', { cacheDisabled: true });
 await cmd('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: false });
 // FREEZE=1: fixed clock (rAF timestamps + performance.now) for deterministic, diffable frames
+if (process.env.DL) await cmd('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: process.env.DL });
 if (process.env.FREEZE) await cmd('Page.enable'), await cmd('Page.addScriptToEvaluateOnNewDocument', { source: `{const T=1000;performance.now=()=>T;const r=requestAnimationFrame.bind(window);window.requestAnimationFrame=(cb)=>r(()=>cb(T));}` });
 await cmd('Page.navigate', { url });
 await sleep(4000);

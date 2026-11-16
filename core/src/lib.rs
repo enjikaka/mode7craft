@@ -77,18 +77,19 @@ fn hgt(x: i32, y: i32) -> i32 {
 #[no_mangle] pub extern "C" fn pick_ptr() -> *const i32 { unsafe { PICK.as_ptr() } }
 #[no_mangle] pub extern "C" fn get_block(x: i32, y: i32, z: i32) -> u32 { get(x, y, z) as u32 }
 
+const TORCH: u8 = 8; // torch: light source, no collision, not terrain
 // derived data: H = top of terrain-like blocks (not logs/leaves), used for water depth/foam
 fn recompute_h(x: i32, y: i32) {
     if x < 0 || y < 0 || x >= N as i32 || y >= N as i32 { return; }
     let mut h = 0;
     let mut z = NZ as i32 - 1;
-    while z >= 0 { let b = get(x, y, z); if b != 0 && b != WOOD && b != LEAF { h = z + 1; break; } z -= 1; }
+    while z >= 0 { let b = get(x, y, z); if b != 0 && b != WOOD && b != LEAF && b != TORCH { h = z + 1; break; } z -= 1; }
     unsafe { H[y as usize * N + x as usize] = h as u8; }
 }
 /// raw edit (used for loading saved edits). returns 1 if changed.
 #[no_mangle]
 pub extern "C" fn set_block(x: i32, y: i32, z: i32, id: u32) -> i32 {
-    if x < 0 || y < 0 || z < 0 || x >= N as i32 || y >= N as i32 || z >= NZ as i32 || id > 7 { return 0; }
+    if x < 0 || y < 0 || z < 0 || x >= N as i32 || y >= N as i32 || z >= NZ as i32 || id > 8 { return 0; }
     if get(x, y, z) as u32 == id { return 0; }
     set(x, y, z, id as u8); recompute_h(x, y); 1
 }
@@ -105,7 +106,7 @@ pub extern "C" fn place_block(x: i32, y: i32, z: i32, id: u32) -> i32 {
     if id == 0 || get(x, y, z) != 0 || x < 0 || y < 0 || z < 0 || x >= N as i32 || y >= N as i32 || z >= NZ as i32 { return 0; }
     let s = unsafe { &S };
     let (fx, fy, fz) = (x as f32, y as f32, z as f32);
-    if s[0] + R > fx && s[0] - R < fx + 1.0 && s[1] + R > fy && s[1] - R < fy + 1.0 && s[2] + PH > fz && s[2] < fz + 1.0 { return 0; }
+    if id as u8 != TORCH && s[0] + R > fx && s[0] - R < fx + 1.0 && s[1] + R > fy && s[1] - R < fy + 1.0 && s[2] + PH > fz && s[2] < fz + 1.0 { return 0; }
     set_block(x, y, z, id)
 }
 /// voxel DDA pick from (o) along (d) up to maxd. returns 1 and fills PICK on hit.
@@ -204,7 +205,7 @@ pub extern "C" fn gen(seed: u32) {
 fn solid(bx: i32, by: i32, bz: i32) -> bool {
     if bx < 0 || by < 0 || bx >= N as i32 || by >= N as i32 { return true; }
     if bz < 0 { return true; }
-    if get(bx, by, bz) != 0 { return true; }
+    let b = get(bx, by, bz); if b != 0 && b != TORCH { return true; }
     (unsafe { SEA[by as usize * N + bx as usize] } != 0) && bz < WL + 4
 }
 const R: f32 = 0.28; const PH: f32 = 1.7;
