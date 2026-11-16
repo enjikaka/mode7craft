@@ -34,4 +34,14 @@ assert.deepEqual([...P].slice(0, 4), [nx, py, Math.floor(pz + 1.5), -1]);
 // player physics still fine: walk into the tower -> blocked
 for (let i = 0; i < 60; i++) e.step(1 / 60, 0, 1, 0, 0);
 assert.ok(S[0] < nx - 0.2, 'tower blocks player, x=' + S[0]);
+// wading: the shallow shelf (floor 0.75 under the surface) is walkable, deeper sea is a wall
+e.gen(1337);
+const row = (y: number) => [...Array(N).keys()].map((x) => H()[y * N + x]);
+const r57 = row(57); const xb = r57.findIndex((h, x) => h >= 3 && r57[x - 1] === 2);   // first beach column after the shelf
+const xs = r57.lastIndexOf(1, xb);                                                     // last deeper column before the shelf
+assert.ok(xb > 0 && xs > 0 && xs < xb - 1, 'shelf exists at y=57');
+S[0] = xb + 0.5; S[1] = 57.5; S[2] = H()[57 * N + xb]; S[3] = 0;
+for (let i = 0; i < 240; i++) e.step(1 / 60, 0, 1, Math.PI, 0);
+assert.ok(Math.abs(S[2] - 2) < 0.01, 'stands on the shelf floor, z=' + S[2]);
+assert.ok(S[0] > xs + 1 && S[0] < xs + 1.4, 'stopped at the deeper water, x=' + S[0]);
 console.log('edit tests OK');

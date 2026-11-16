@@ -24,7 +24,7 @@ const WOOD: u8 = 5; const LEAF: u8 = 6;
 
 static mut W: [u8; N * N * NZ] = [0; N * N * NZ];
 static mut H: [u8; N * N] = [0; N * N];
-// gen-time sea mask (player can't walk into the original sea)
+// gen-time sea mask: the player can wade on the shallow shelf (floor 0.75 below the surface) but not into deeper sea
 static mut SEA: [u8; N * N] = [0; N * N];
 // pick result: bx,by,bz,nx,ny,nz
 static mut PICK: [i32; 6] = [0; 6];
@@ -146,7 +146,9 @@ pub extern "C" fn gen(seed: u32) {
             let r = sqrt(dx * dx + dy * dy) + (vnoise(x as f32 * 0.05, y as f32 * 0.05) - 0.5) * 0.35;
             let e = fbm(x as f32 / 22.0, y as f32 / 22.0);
             let v = e * 1.3 + 0.12 - r * r * 1.2;
-            let h = clamp(floor(v * 8.0), 0.0, 9.0) as i32;
+            // below sea level the floor slopes at about half the land slope: wide shallow shelves
+            let f = v * 8.0; let f = if f < WL as f32 { WL as f32 + (f - WL as f32) * 0.7 } else { f };
+            let h = clamp(floor(f), 0.0, 9.0) as i32;
             unsafe { H[y as usize * N + x as usize] = h as u8; }
             for z in 0..h {
                 let top = z == h - 1;
@@ -155,7 +157,7 @@ pub extern "C" fn gen(seed: u32) {
             }
         }
     }
-    for i in 0..N * N { unsafe { SEA[i] = (H[i] < WL as u8) as u8; } }
+    for i in 0..N * N { unsafe { SEA[i] = (H[i] < WL as u8 - 1) as u8; } }
     // a few birch trees
     let mut trees = 0;
     for y in 4..N as i32 - 4 {

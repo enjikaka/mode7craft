@@ -226,29 +226,67 @@ fn birch(p: vec3f, n: vec3f) -> vec3f {
   if (h2(vec2i(u / 2 + cell.y * 5, v / 2 + cell.x * 3 + cell.z * 4)) > 0.985 && (v & 1) == 0) { c = c3(0x18181bu); }
   return c;
 }
-fn water(p: vec2f, sh: f32) -> vec3f {
-  let t = vec2i(floor(p * S)); let tm = U[0].z;
-  let hb = height(t >> vec2u(3u));
-  // distance to land in texels (rough, 4 dirs x 3)
-  var dl = 9;
-  for (var k = 1; k <= 3; k++) {
-    if (height((t + vec2i(k, 0)) >> vec2u(3u)) >= 3 || height((t - vec2i(k, 0)) >> vec2u(3u)) >= 3 ||
-        height((t + vec2i(0, k)) >> vec2u(3u)) >= 3 || height((t - vec2i(0, k)) >> vec2u(3u)) >= 3) { dl = min(dl, k); }
+// ---- layered water (v7): stepped depth bands over a visible, teal-tinted sea floor ----
+struct WR { c: vec3f, k: f32, a: f32 };   // colour, k=1 foam/sparkle (stays bright), a = band opacity
+fn hcl(b: vec2i) -> f32 { return f32(min(height(b), 3)); }
+// solid at water level under texel t (blocks, leaves, round logs; torches don't count)
+fn wsol(t: vec2i) -> bool {
+  let b = vec3i(t >> vec2u(3u), 2); let id = block(b);
+  if (id == 0u || id == 8u) { return false; }
+  if (id == 5u) { let e = (vec2f(t) + .5) / S - vec2f(b.xy) - .5; return dot(e, e) < TR * TR; }
+  return true;
+}
+// any solid within k texels (4-neighbourhood); only cells across a block border are loaded,
+// since the water texel's own cell is empty (unless it holds a log)
+fn wedge(t: vec2i, k: i32, own: bool) -> bool {
+  let l = t & vec2i(7);
+  return ((own || l.x + k > 7) && wsol(t + vec2i(k, 0))) || ((own || l.x < k) && wsol(t - vec2i(k, 0))) ||
+         ((own || l.y + k > 7) && wsol(t + vec2i(0, k))) || ((own || l.y < k) && wsol(t - vec2i(0, k)));
+}
+fn water(d: vec3f, p: vec3f, sh: f32, dark: bool) -> WR {
+  let t = vec2i(floor(p.xy * S)); let tc = (vec2f(t) + .5) / S; let tm = U[0].z;
+  // depth: sea floor height smoothed over block columns (rounded, jittered band contours)
+  let g = tc - 0.5; let gi = vec2i(floor(g)); let gf = fract(g);
+  let hs = mix(mix(hcl(gi), hcl(gi + vec2i(1, 0)), gf.x), mix(hcl(gi + vec2i(0, 1)), hcl(gi + vec2i(1, 1)), gf.x), gf.y);
+  let dj = (h2(t >> vec2u(1u)) - 0.5) * 0.4;
+  var dv = ZW - hs; var under = vec3f(0.); var seen = false;
+  if (dv + dj < 2.45) {
+    // see-through: refracted ray to the sea floor / object bases / the avatar's legs (open deep sea is opaque: skipped)
+    let rd = refract(d, vec3f(0., 0., 1.), 0.75);
+    var h = traceBlocks(p, rd, 0., min(p.z / max(-rd.z, 0.1), 8.), 12);
+    if (U[7].x < 0.5) { let hp = tracePlayer(p, rd, h.t); if (hp.id != 0u) { h = hp; } }
+    let q = p + rd * h.t;
+    if (h.id != 0u) {
+      let ht = vec3i(floor((q - h.n * 0.002) * S));
+      under = select(matCol(h.id, ht, select(select(2, 1, abs(h.n.x) > 0.5), 0, h.n.z > 0.5)), birch(q, h.n), h.id == 5u);
+      under *= select(0.8, 1., h.n.z > 0.5);
+    } else { under = c3(0xa08a5au); }
+    dv = mix(ZW - q.z, dv, 0.5); seen = true;
   }
-  // depth from smoothed sea floor
-  let n = h2(t >> vec2u(1u)) * 0.6;
-  let dep = (2.7 - f32(hb)) + n - select(0., 1.2, dl <= 3);
-  var c = c3(0x2f5bc4u);
-  if (dep < 1.0) { c = c3(0x59c2c4u); } else if (dep < 1.9) { c = c3(0x3f8ad6u); }
-  // moving sparkle dashes
-  let wt = vec2i(floor(vec2f(p.x * S + tm * 3., p.y * S) / vec2f(3., 1.)));
-  let sp = h2(wt + vec2i(i32(tm * 0.8) * 37, 0));
-  if (sp > 0.985) { c = vec3f(0.95, 0.98, 1.); } else if (sp > 0.965) { c = mix(c, vec3f(0.62, 0.8, 1.), 0.7); }
-  if (sh < 0.5) { c = mix(c, c3(0x1b2f78u), 0.55); }
-  let ph = i32(tm * 3.);
-  if (dl == 1 && h2(t + vec2i(ph * 13, 0)) > 0.15) { c = vec3f(0.96, 0.98, 1.); }
-  else if (dl == 2 && h2(t + vec2i(0, ph * 7)) > 0.6) { c = mix(c, vec3f(1.), 0.8); }
-  return c;
+  let db = dv + dj;
+  var c = c3(0x1a5a8eu); var a = 1.;
+  if (db < 1.) { c = c3(0x45ada9u); a = 0.5; } else if (db < 1.45) { c = c3(0x3299a6u); a = 0.64; }
+  else if (db < 1.95) { c = c3(0x25849du); a = 0.78; } else if (db < 2.45) { c = c3(0x1e6e96u); a = 0.9; }
+  if (seen) { c = mix(under * vec3f(0.55, 0.74, 0.74), c, a); }
+  let lit = sh > 0.5; var k = 0.;
+  if (!lit && dark) { c *= vec3f(0.6, 0.68, 0.8); }   // shadow patches from trees, objects, clouds
+  // sparkles: fixed spots twinkling in frame steps, mostly over shallow lit water
+  if (lit && h2(t) > select(0.9985, 0.982, db < 1.95) && ((i32(tm * 2.) + i32(h2(t + vec2i(71, 3)) * 5.)) % 5) < 2) {
+    c = select(c3(0xbfeaf7u), vec3f(0.97, 0.99, 1.), h2(t + vec2i(5, 9)) > 0.45); k = 1.;
+  }
+  // 1-px shoreline where the surface meets anything solid (coast, placed blocks, trunks), pulsing slowly
+  let ph = i32(tm * 1.5);
+  let lg = block(vec3i(t >> vec2u(3u), 2)) == 5u;
+  if (wedge(t, 1, lg)) { c = select(c3(0xb8e6f6u), vec3f(0.95, 0.99, 1.), h2(t + vec2i(ph * 13, ph * 7)) > 0.3); k = 1.; }
+  else if (wedge(t, 2, lg) && ((ph + i32(h2(t) * 4.)) & 3) == 0) { c = mix(c, c3(0xc8eefau), 0.55); }
+  // wading: foam ring at the avatar's legs + a slow ripple
+  let P = U[5].xyz;
+  if (P.z < ZW && P.z > ZW - 1.6) {
+    let r = length(tc - P.xy); let ro = 0.48 + fract(tm * 0.6) * 0.45;
+    if (r > 0.26 && r < 0.38 && h2(t + vec2i(ph * 5, 0)) > 0.25) { c = vec3f(0.95, 0.99, 1.); k = 1.; }
+    else if (abs(r - ro) < 0.06 && h2(t) > 0.35) { c = mix(c, c3(0xc8eefau), 0.7); }
+  }
+  return WR(c, k, a);
 }
 fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z * 3., 0., 1.)); }
 
@@ -324,7 +362,7 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
       tt = tw;
       let p = o + d * tw;
       if (HQ) { col = hqWater(p, d); }
-      else { col = water(p.xy, shadow(vec3f((floor(p.xy * S) + .5) / S, ZW))); if (U[9].z > 0.) { col += col * torchL(p, vec3f(0., 0., 1.), false) * 0.6; } }
+      else { col = water(d, p, shadow(vec3f((floor(p.xy * S) + .5) / S, ZW)), true).c; if (U[9].z > 0.) { col += col * torchL(p, vec3f(0., 0., 1.), false) * 0.6; } }
     }
   } else {
     let p = o + d * hb.t; let n = hb.n;
@@ -482,7 +520,10 @@ fn hqShade(p: vec3f, n: vec3f, ht: vec3i, id: u32, isLog: bool, part: bool, base
 fn hqWater(p: vec3f, d: vec3f) -> vec3f {
   let tq = (floor(p.xy * S) + .5) / S; let tm = U[0].z;
   let sh = hqShadow(vec3f(tq, ZW), 0.5);
-  let base = lin(water(p.xy, 1.));           // palette: depth tint, foam, sparkles (refraction tint)
+  let w = water(d, p, sh, false); let base = lin(w.c);   // layered palette: bands, sea floor, foam, sparkles
+  let amb = U[7].yzw; let sun = U[19].xyz;
+  var tl = vec3f(0.); if (U[9].z > 0.) { tl = torchL(p, vec3f(0., 0., 1.), false) * 1.5; }
+  if (w.k > 0.5) { return base * (amb * 0.8 + sun * (0.4 + 0.45 * sh) + tl); }   // foam/sparkle: diffuse, no reflection
   let wn = normalize(vec3f(vn(tq * 1.7 + tm * 0.7) - .5, vn(tq.yx * 1.3 - tm * 0.6) - .5, 9.));
   let r = reflect(d, wn);
   var rc = hqSky(r);
@@ -492,10 +533,11 @@ fn hqWater(p: vec3f, d: vec3f) -> vec3f {
     let a = select(matCol(h.id, vec3i(floor((q - h.n * 0.002) * S)), select(1, 0, h.n.z > 0.5)), birch(q, h.n), h.id == 5u);
     rc = hqLight(lin(a), h.n, 0.8, 0.85, vec3f(0.));
   }
-  let fr = 0.03 + 0.6 * pow(1. - abs(d.z), 5.);
-  var c = mix(base * (U[7].yzw * 0.9 + U[19].xyz * (0.2 + 0.25 * sh)), rc, fr);
-  if (U[9].z > 0.) { c += base * torchL(p, vec3f(0., 0., 1.), false) * 1.5; }
-  return c + U[19].xyz * pow(max(dot(r, sunL()), 0.), 900.) * 8. * sh;   // sun glint
+  // reflections: strongest over deep (opaque) bands at grazing angles, weak over the shallow shelf
+  let fr = (0.03 + 0.6 * pow(1. - abs(d.z), 5.)) * mix(0.3, 1., w.a * w.a);
+  var c = mix(base * (amb * 0.85 + sun * (0.12 + 0.38 * sh)), rc, fr);
+  c += base * tl;
+  return c + sun * pow(max(dot(r, sunL()), 0.), 900.) * 8. * sh * w.a;   // sun glint
 }
 fn hqCloud(cc: vec3f, t: f32, o: vec3f, d: vec3f) -> vec3f {
   let c = lin(cc) * (U[19].xyz * 1.1 + U[7].yzw * 0.6);

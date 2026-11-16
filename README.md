@@ -1,4 +1,4 @@
-# Mode7craft v6
+# Mode7craft v7
 
 ![Mode7craft](docs/screenshot.png)
 
@@ -8,6 +8,16 @@ A tiny Minecraft-style island rendered SNES Mode 7 / sprite-stacking style: no m
 - Block editing: only the touched voxel and heightmap texel are re-uploaded to the GPU. Hotbar: grass, dirt, stone, sand, birch log, leaves, planks, torch. Edits persist in localStorage (`m7c-edits-1`); `?reset` clears them.
 - Birch logs are analytic ray-cylinder hits (they cast round shadows too) with procedural bark: off-white, dark dashes and sparse knots.
 - `web/scene.wgsl`: one full-screen fragment shader, no meshes. Terrain and trees use an exact voxel DDA (Amanatides-Woo) over the block grid. The sprite-stacked avatar uses a texel DDA in its own bounding box. Clouds are stacked 2D slices. The whole cloud cluster that hides the avatar, or that it stands under, is drawn at ~50% with a screen-stable 4x4 Bayer dither; clouds near the camera step down in dither levels. Views: chase, first person (with a pixel crosshair drawn in the blit pass) and top-down. V, Y or VIEW cycles them. 8x8 procedural pixel textures, shadows, water/foam and fog.
+- Layered water (v7, Standard and HQ), after asynkimo's "Basic water tile vs Layered water":
+  - Stepped depth bands, from semi-transparent shallow teal over the sand to opaque deep blue-teal. Depth comes from the sea-floor height, smoothed over block columns and jittered per 2x2 texels, so band edges are pixel-art steps that follow the slope.
+  - The sea floor slopes at about half the land slope (generator change below sea level only), so there are wide shallow shelves.
+  - Through the shallow bands a short refracted ray (12 DDA steps) shows the sea floor, the submerged bases of blocks and trunks, and the avatar's legs, all tinted teal. Open deep sea skips that ray.
+  - A 1-texel light-blue/white shoreline where the surface touches anything solid: the coast, placed blocks, round logs. It pulses slowly, with a dotted second ring.
+  - Shadows from trees, objects and clouds darken the water and suppress sparkles.
+  - Sparkles are fixed spots that twinkle in frame steps, mostly over shallow lit water.
+  - Wading: the shallow shelf (floor 0.75 below the surface) is walkable, with a foam ring and a slow ripple around the avatar. Deeper sea is still a wall.
+  - In HQ the layered colour is lit by sun and sky. Reflections are weak over the shallows and strongest over deep water at grazing angles, and the sun glint is kept. Foam and sparkles are lit diffusely without reflection.
+  - Everything outside water is unchanged from v6 in Standard: verified with `tools/maskdiff.py` against a water-mask build.
 - Torches (hotbar slot 8): pixel-art stick with a flickering flame, no collision (you can walk through them and place them where you stand). The nearest 32 torches (re-sorted every 0.3 s) go into a 512-byte uniform list; each is a warm point light with range 8 and per-torch flicker. Standard adds a subtle unoccluded warm glow. HQ uses an emissive flame (it blooms) and a shadow ray per torch, so walls block the light.
 - Sunlight through tree crowns (HQ only): sun shadow rays pass through leaves with a per-voxel transmittance (some voxels let 80% of the light through, the rest 12%), which gives dappled light on the ground. Backlit leaves glow when you look toward the sun, and the light shafts trace the canopy near the ground.
 - World save/share (settings panel, row `Värld`):
@@ -37,6 +47,7 @@ A tiny Minecraft-style island rendered SNES Mode 7 / sprite-stacking style: no m
     node tools/test-edit.ts              # Node tests for pick/break/place/collision
     FREEZE=1 NOUI=1 node tools/shot.ts ...  # frozen clock + hidden DOM overlays: deterministic, diffable frames
     python3 tools/diff.py a.png b.png    # pixel diff (used to prove Standard == v4)
+    python3 tools/maskdiff.py old.png new.png mask.png  # changed pixels outside water (Standard v6 vs v7 check)
 
 URL params (debug): `?fx=0|1` graphics Standard/HQ, `?tod=day|eve|cyc|<hours>` HQ sun, `?area=` internal pixel budget, `?v=0|1|2` chase / first person / top-down, `?z=1.5` zoom, `?r=3.14` camera yaw offset, `?pt=0.4` pitch, `?p=75,65` teleport, `?t=40` cloud time offset.
 wasm-opt is looked up on PATH, then in node_modules/.bin.
