@@ -6,11 +6,12 @@ struct V { @builtin(position) p: vec4f };
   var o: V; let x = f32((i << 1u) & 2u); let y = f32(i & 2u);
   o.p = vec4f(x * 2. - 1., 1. - y * 2., 0., 1.); return o;
 }
-@group(0) @binding(0) var<uniform> U: array<vec4f, 8>;
+@group(0) @binding(0) var<uniform> U: array<vec4f, 20>;
 @group(0) @binding(1) var vox: texture_3d<u32>;
 @group(0) @binding(2) var hm: texture_2d<u32>;
 
 const N = 128; const NZ = 16; const S = 8.; const ZW = 2.75; const CB = 15.5; 
+const TR = 0.34; // trunk radius
 const SUN = vec3f(-0.5, 0.42, 0.757);
 const FOG = vec3f(0.761, 0.859, 0.941);
 
@@ -111,10 +112,21 @@ fn traceBlocks(ro: vec3f, rd: vec3f, tA: f32, tB: f32, steps: i32) -> Hit {
   for (var i = 0; i < steps; i++) {
     let id = block(c);
     if (id == 5u) {
-      // trunk: thin box inside the cell (exact)
-      var bn = n;
-      let r = slab(ro, inv, rd, vec3f(c) + vec3f(.25, .25, 0.), vec3f(c) + vec3f(.75, .75, 1.), &bn);
-      if (r.x <= r.y && r.y >= t) { h.t = max(r.x, t); h.id = 5u; h.n = select(n, bn, r.x >= t); return h; }
+      // birch log: analytic vertical cylinder inside the voxel (caps + side), no meshes
+      let cc = vec2f(c.xy) + .5; let tx = min(min(tm.x, tm.y), tm.z);
+      let pe = ro + rd * t;
+      if (abs(n.z) > 0.5 && length(pe.xy - cc) < TR) {
+        // entered through a z face inside the circle: a cap, unless the log continues there (joint)
+        h.t = t; h.id = 5u;
+        h.n = select(n, vec3f(normalize(pe.xy - cc + 1e-5), 0.), block(c + vec3i(n)) == 5u);
+        return h;
+      }
+      let oc = ro.xy - cc; let a = dot(rd.xy, rd.xy); let b = dot(oc, rd.xy); let k = dot(oc, oc) - TR * TR;
+      let disc = b * b - a * k;
+      if (a > 1e-9 && disc > 0.) {
+        let t1 = (-b - sqrt(disc)) / a;
+        if (t1 >= t - 1e-4 && t1 <= tx) { h.t = t1; h.id = 5u; h.n = vec3f(normalize(ro.xy + rd.xy * t1 - cc), 0.); return h; }
+      }
     } else if (id != 0u) { h.t = t; h.id = id; h.n = n; return h; }
     if (tm.x < tm.y && tm.x < tm.z) { t = tm.x; tm.x += dl.x; c.x += st.x; n = vec3f(f32(-st.x), 0., 0.); }
     else if (tm.y < tm.z) { t = tm.y; tm.y += dl.y; c.y += st.y; n = vec3f(0., f32(-st.y), 0.); }
@@ -172,8 +184,13 @@ fn matCol(id: u32, t: vec3i, face: i32) -> vec3f {
     case 2u: { c = c3(0x8a5a34u) * select(1., 0.8, r < .25); }
     case 3u: { c = c3(0xd6c983u) * select(1., 0.92, r < .2); if (face != 0) { c *= 0.9; } }
     case 4u: { c = c3(0x959e9eu) * select(1., 0.86, r < .3); if (r > .95) { c *= 1.1; } }
-    case 5u: { c = select(c3(0x7a5230u) * select(1., 0.8, l.x == 3 || l.y == 4), c3(0xb08a55u), face == 0); }
-    case 6u: { c = c3(0x307026u) * select(1., select(0.78, 1.25, r > .5), r < .2 || r > .9); }
+    case 5u: { c = select(c3(0xebe7dcu), c3(0x3b3b3bu), r < .2); }
+    case 6u: { c = select(select(c3(0x86b83au), c3(0xa6d24eu), r > .88), c3(0x5f9029u), r < .22); }
+    case 7u: {
+      let vv = select(l.z, l.y, face == 0); let uu = select(l.x, l.y, face == 1); let row = (vv >> 2u) + b.z * 2;
+      c = c3(0xb8915au) * (0.93 + 0.1 * h2(vec2i(row, b.x * 7 + b.y)));
+      if ((vv & 3) == 3 || uu == ((row * 5 + b.x + b.y) & 7)) { c *= 0.72; } else if (r < .12) { c *= 0.9; }
+    }
     case 10u: { c = c3(0x2b3a8cu); }
     case 11u: { c = c3(0x3fa9c9u); }
     case 12u: { c = c3(0xe0a878u); }
@@ -181,6 +198,23 @@ fn matCol(id: u32, t: vec3i, face: i32) -> vec3f {
     case 14u: { c = c3(0x1a1a2au); }
     default: { c = c3(0x2a2a2au); }
   }
+  return c;
+}
+// birch bark wrapped around the cylinder by angle; cap shows rings
+fn birch(p: vec3f, n: vec3f) -> vec3f {
+  let cell = vec3i(floor(p - n * 0.002)); let cc = vec2f(cell.xy) + .5;
+  if (abs(n.z) > 0.5) {
+    let r = length(p.xy - cc) * S;
+    if (r > 2.1) { return c3(0xebe7dcu); }
+    return select(c3(0xe0cfa0u), c3(0xc2a873u), (i32(floor(r)) & 1) == 1);
+  }
+  let ang = atan2(p.y - cc.y, p.x - cc.x);
+  let u = i32(floor((ang / 6.2831853 + .5) * 18.)) % 18; let v = i32(floor(p.z * S));
+  var c = select(c3(0xefebe1u), c3(0xd8d3c7u), h2(vec2i(u, v) + cell.xy * 31) > 0.8);
+  // lenticels: short thin horizontal dashes; knots: rare small black marks
+  let dsh = h2(vec2i(u / 4 + cell.x * 13, v + cell.y * 17 + cell.z * 8));
+  if (dsh > 0.84 && u % 4 != 3) { c = select(c3(0x55555au), c3(0x2e2e32u), dsh > 0.93); }
+  if (h2(vec2i(u / 2 + cell.y * 5, v / 2 + cell.x * 3 + cell.z * 4)) > 0.985 && (v & 1) == 0) { c = c3(0x18181bu); }
   return c;
 }
 fn water(p: vec2f, sh: f32) -> vec3f {
@@ -257,6 +291,16 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
   let tEnd = select(min(far, tw), min(ct, tw), ca > 0.5);
   var hb = traceBlocks(o, d, 0., tEnd, 320);
   if (!fps) { let hp = tracePlayer(o, d, hb.t); if (hp.id != 0u) { hb = hp; } }
+  // break particles: tiny analytic cubes
+  var part = false;
+  if (U[9].y > 0.5) {
+    let inv = sinv(d);
+    for (var i = 0; i < 8; i++) {
+      let P = U[10 + i]; if (P.w <= 0.) { continue; }
+      var pn = vec3f(0.); let r = slab(o, inv, d, P.xyz - P.w, P.xyz + P.w, &pn);
+      if (r.x <= r.y && r.x > 0. && r.x < hb.t) { hb.t = r.x; hb.id = u32(U[9].x); hb.n = pn; part = true; }
+    }
+  }
   var col: vec3f; var tt = hb.t;
   if (hb.id == 0u && ca > 0.5 && ct < tw) { return vec4f(cloudCol, 1.); }
   if (hb.id == 0u) {
@@ -270,11 +314,15 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
     let p = o + d * hb.t; let n = hb.n;
     let ht = vec3i(floor((p - n * 0.002) * S));          // texel inside the hit voxel, robust on faces
     let face = select(select(2, 1, abs(n.x) > 0.5), 0, n.z > 0.5);
-    col = matCol(hb.id, ht, face);
+    let isLog = hb.id == 5u && !part;
+    col = select(matCol(hb.id, ht, face), birch(p, n), isLog);
     var lit = 1.;
-    if (face == 0) {
+    if (isLog) {
+      let ld = dot(n, SUN);
+      lit = select(0., select(0.84, 1.0, ld > 0.45), ld > 0.05);
+    } else if (face == 0) {
       let l = ht & vec3i(7); let b = ht >> vec3u(3u);
-      if (hb.id < 5u) {
+      if (hb.id < 5u && !part) {
         // contour: dark line at the foot of a higher step; rim light towards the sun
         if ((l.x == 0 && block(b + vec3i(-1, 0, 1)) != 0u) || (l.x == 7 && block(b + vec3i(1, 0, 1)) != 0u) ||
             (l.y == 0 && block(b + vec3i(0, -1, 1)) != 0u) || (l.y == 7 && block(b + vec3i(0, 1, 1)) != 0u)) { col *= 0.72; }
@@ -288,9 +336,19 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
       col *= vec3f(0.64, 0.7, 0.84);
     } else {
       // shadow probe from the texel centre on the face (stable, pixel-art crisp)
-      let q = (vec3f(ht) + .5) / S + n * (0.5 / S + 0.01);
+      let q = select((vec3f(ht) + .5) / S + n * (0.5 / S + 0.01), p + n * 0.03, isLog);
       col *= lit;
       if (shadow(q) < 0.5) { col *= vec3f(0.58, 0.64, 0.8); }
+    }
+    // targeted block: pixel-crisp dark outline on its edges + light face tint
+    if (U[8].w > 0.5 && !part && hb.id < 10u) {
+      let cell = vec3i(floor(p - n * 0.002));
+      if (all(cell == vec3i(U[8].xyz))) {
+        let f = p - vec3f(cell); let e3 = min(f, 1. - f); var e = 1.;
+        if (abs(n.x) < 0.5) { e = min(e, e3.x); } if (abs(n.y) < 0.5) { e = min(e, e3.y); } if (abs(n.z) < 0.5) { e = min(e, e3.z); }
+        let pix = hb.t * 2. * U[0].w / U[0].y;
+        if (e < max(0.06, pix * 1.2)) { col = vec3f(0.07, 0.07, 0.1); } else { col = mix(col, vec3f(1.), 0.18); }
+      }
     }
   }
   col = mix(col, FOG, fogOn * smoothstep(far * 0.35, far, tt));

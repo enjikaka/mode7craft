@@ -24,6 +24,10 @@ const WOOD: u8 = 5; const LEAF: u8 = 6;
 
 static mut W: [u8; N * N * NZ] = [0; N * N * NZ];
 static mut H: [u8; N * N] = [0; N * N];
+// gen-time sea mask (player can't walk into the original sea)
+static mut SEA: [u8; N * N] = [0; N * N];
+// pick result: bx,by,bz,nx,ny,nz
+static mut PICK: [i32; 6] = [0; 6];
 // state: 0 x,1 y,2 z,3 vz,4 fx,5 fy,6 walk phase,7 moving(0..1),8 onGround,9 trees
 static mut S: [f32; 16] = [0.0; 16];
 static mut SEED: u32 = 1;
@@ -70,6 +74,65 @@ fn hgt(x: i32, y: i32) -> i32 {
 #[no_mangle] pub extern "C" fn world_ptr() -> *const u8 { unsafe { W.as_ptr() } }
 #[no_mangle] pub extern "C" fn height_ptr() -> *const u8 { unsafe { H.as_ptr() } }
 #[no_mangle] pub extern "C" fn state_ptr() -> *const f32 { unsafe { S.as_ptr() } }
+#[no_mangle] pub extern "C" fn pick_ptr() -> *const i32 { unsafe { PICK.as_ptr() } }
+#[no_mangle] pub extern "C" fn get_block(x: i32, y: i32, z: i32) -> u32 { get(x, y, z) as u32 }
+
+// derived data: H = top of terrain-like blocks (not logs/leaves), used for water depth/foam
+fn recompute_h(x: i32, y: i32) {
+    if x < 0 || y < 0 || x >= N as i32 || y >= N as i32 { return; }
+    let mut h = 0;
+    let mut z = NZ as i32 - 1;
+    while z >= 0 { let b = get(x, y, z); if b != 0 && b != WOOD && b != LEAF { h = z + 1; break; } z -= 1; }
+    unsafe { H[y as usize * N + x as usize] = h as u8; }
+}
+/// raw edit (used for loading saved edits). returns 1 if changed.
+#[no_mangle]
+pub extern "C" fn set_block(x: i32, y: i32, z: i32, id: u32) -> i32 {
+    if x < 0 || y < 0 || z < 0 || x >= N as i32 || y >= N as i32 || z >= NZ as i32 || id > 7 { return 0; }
+    if get(x, y, z) as u32 == id { return 0; }
+    set(x, y, z, id as u8); recompute_h(x, y); 1
+}
+/// break a block (z=0 is bedrock). returns the old id or 0.
+#[no_mangle]
+pub extern "C" fn break_block(x: i32, y: i32, z: i32) -> u32 {
+    let b = get(x, y, z);
+    if b == 0 || z <= 0 { return 0; }
+    set_block(x, y, z, 0); b as u32
+}
+/// place a block; refuses occupied cells and cells overlapping the player. returns 1 on success.
+#[no_mangle]
+pub extern "C" fn place_block(x: i32, y: i32, z: i32, id: u32) -> i32 {
+    if id == 0 || get(x, y, z) != 0 || x < 0 || y < 0 || z < 0 || x >= N as i32 || y >= N as i32 || z >= NZ as i32 { return 0; }
+    let s = unsafe { &S };
+    let (fx, fy, fz) = (x as f32, y as f32, z as f32);
+    if s[0] + R > fx && s[0] - R < fx + 1.0 && s[1] + R > fy && s[1] - R < fy + 1.0 && s[2] + PH > fz && s[2] < fz + 1.0 { return 0; }
+    set_block(x, y, z, id)
+}
+/// voxel DDA pick from (o) along (d) up to maxd. returns 1 and fills PICK on hit.
+#[no_mangle]
+pub extern "C" fn pick(ox: f32, oy: f32, oz: f32, dx: f32, dy: f32, dz: f32, maxd: f32) -> i32 {
+    let o = [ox, oy, oz]; let d = [dx, dy, dz];
+    let mut c = [floor(ox) as i32, floor(oy) as i32, floor(oz) as i32];
+    let mut st = [0i32; 3]; let mut tm = [0f32; 3]; let mut dl = [0f32; 3];
+    for a in 0..3 {
+        st[a] = if d[a] > 0.0 { 1 } else { -1 };
+        dl[a] = if abs(d[a]) < 1e-9 { 1e30 } else { abs(1.0 / d[a]) };
+        let edge = c[a] as f32 + if d[a] > 0.0 { 1.0 } else { 0.0 };
+        tm[a] = if abs(d[a]) < 1e-9 { 1e30 } else { (edge - o[a]) / d[a] };
+    }
+    let mut n = [0i32; 3]; let mut t = 0.0;
+    let mut i = 0;
+    while t <= maxd && i < 256 {
+        if c[2] >= 0 && c[2] < NZ as i32 && get(c[0], c[1], c[2]) != 0 {
+            unsafe { PICK = [c[0], c[1], c[2], n[0], n[1], n[2]]; }
+            return 1;
+        }
+        let a = if tm[0] < tm[1] && tm[0] < tm[2] { 0 } else if tm[1] < tm[2] { 1 } else { 2 };
+        t = tm[a]; tm[a] += dl[a]; c[a] += st[a]; n = [0, 0, 0]; n[a] = -st[a];
+        i += 1;
+    }
+    0
+}
 
 #[no_mangle]
 pub extern "C" fn gen(seed: u32) {
@@ -91,7 +154,8 @@ pub extern "C" fn gen(seed: u32) {
             }
         }
     }
-    // a few trees
+    for i in 0..N * N { unsafe { SEA[i] = (H[i] < WL as u8) as u8; } }
+    // a few birch trees
     let mut trees = 0;
     for y in 4..N as i32 - 4 {
         for x in 4..N as i32 - 4 {
@@ -103,14 +167,22 @@ pub extern "C" fn gen(seed: u32) {
             let mut ok = true;
             for j in -2..=2 { for i in -2..=2 { if get(x + i, y + j, h) == WOOD || get(x + i, y + j, h + 1) == LEAF || hgt(x + i, y + j) != h { ok = false; } } }
             if !ok { continue; }
-            let th = 3 + (hash(x, y) % 2) as i32;
+            // birch: taller slim trunk, narrow airy crown
+            let th = 4 + (hash(x, y) % 2) as i32;
             for z in 0..th { set(x, y, h + z, WOOD); }
             let tz = h + th;
             for j in -2..=2i32 { for i in -2..=2i32 {
-                let corner = j.abs() == 2 && i.abs() == 2;
-                for z in [tz - 2, tz - 1] { if !(corner && hf(x + i * 3, y + j * 5 + z) < 0.7) && get(x + i, y + j, z) == 0 { set(x + i, y + j, z, LEAF); } }
+                let ring = j.abs() == 2 || i.abs() == 2; let corner = j.abs() == 2 && i.abs() == 2;
+                for z in [tz - 2, tz - 1] {
+                    if corner || (ring && hf(x + i * 3, y + j * 5 + z) < 0.45) { continue; }
+                    if get(x + i, y + j, z) == 0 { set(x + i, y + j, z, LEAF); }
+                }
             } }
-            for j in -1..=1i32 { for i in -1..=1i32 { set(x + i, y + j, tz, LEAF); if i == 0 || j == 0 { set(x + i, y + j, tz + 1, LEAF); } } }
+            for j in -1..=1i32 { for i in -1..=1i32 {
+                if get(x + i, y + j, tz - 3) == 0 && (i == 0 || j == 0) && hf(x + i, y + j * 7) < 0.7 { set(x + i, y + j, tz - 3, LEAF); }
+                if !(i != 0 && j != 0 && hf(x - i, y + j) < 0.5) { set(x + i, y + j, tz, LEAF); }
+                if i == 0 && j == 0 { set(x, y, tz + 1, LEAF); }
+            } }
             trees += 1;
         }
     }
@@ -133,7 +205,7 @@ fn solid(bx: i32, by: i32, bz: i32) -> bool {
     if bx < 0 || by < 0 || bx >= N as i32 || by >= N as i32 { return true; }
     if bz < 0 { return true; }
     if get(bx, by, bz) != 0 { return true; }
-    hgt(bx, by) < WL && bz < WL + 4
+    (unsafe { SEA[by as usize * N + bx as usize] } != 0) && bz < WL + 4
 }
 const R: f32 = 0.28; const PH: f32 = 1.7;
 fn blocked(x: f32, y: f32, z: f32) -> bool {

@@ -5,7 +5,9 @@ const url = process.argv[2] ?? 'http://localhost:8787/';
 const out = process.argv[3] ?? new URL('../screenshot.png', import.meta.url).pathname;
 const w = Number(process.argv[4] ?? 1280), h = Number(process.argv[5] ?? 720);
 const keysArg = process.argv[6] ?? '';
+const evalArg = process.argv[7] ?? '';
 const extra = (process.env.CHFLAGS ?? '').split(' ').filter(Boolean);
+import { rmSync } from 'node:fs'; rmSync('/tmp/chprof/Default/Sessions', { recursive: true, force: true }); rmSync('/tmp/chprof/Default/Current Session', { force: true }); rmSync('/tmp/chprof/Default/Sessions_Encrypted', { recursive: true, force: true });
 const ch = spawn('google-chrome', [...extra, '--headless=new', '--no-sandbox', '--enable-unsafe-webgpu', '--use-angle=swiftshader', '--enable-features=Vulkan,WebGPUService', '--use-vulkan=swiftshader', '--ignore-gpu-blocklist', '--remote-debugging-port=9333', `--window-size=${w},${h}`, '--user-data-dir=/tmp/chprof', 'about:blank'], { stdio: 'ignore' });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let tabs: any[] = [];
@@ -25,10 +27,11 @@ for (const k of keysArg.split(',').filter(Boolean)) {
   await sleep(Number(ms ?? 500));
   await cmd('Input.dispatchKeyEvent', { type: 'keyUp', code, key: code.replace('Key', '').toLowerCase() });
 }
+if (evalArg) { const e = await cmd('Runtime.evaluate', { expression: evalArg, returnByValue: true, awaitPromise: true }); console.log('eval:', JSON.stringify(e.result?.value ?? e.exceptionDetails ?? e)); }
 await sleep(1500);
-const r = await cmd('Runtime.evaluate', { expression: `JSON.stringify({gpu:!!navigator.gpu, err:document.querySelector('#e').textContent, hint:document.querySelector('#h').textContent})`, returnByValue: true });
+const r = await cmd('Runtime.evaluate', { expression: `JSON.stringify({gpu:!!navigator.gpu, err:document.querySelector('#e').textContent, hint:document.querySelector('#h').textContent, ls:(localStorage.getItem('m7c-edits-1')||'').slice(0,80)})`, returnByValue: true });
 console.log('state:', r.result?.value);
 const s = await cmd('Page.captureScreenshot', { format: 'png' });
 writeFileSync(out, Buffer.from(s.data, 'base64')); console.log('saved', out);
-ws.close(); ch.kill('SIGKILL');
+cmd('Browser.close'); await Promise.race([new Promise((r) => ch.once('exit', r)), sleep(3000)]); ws.close(); ch.kill('SIGKILL');
 process.exit(0);
