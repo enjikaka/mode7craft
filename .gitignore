@@ -1,0 +1,5 @@
+core/target/
+node_modules/
+dist/*.gz
+dist/*.br
+

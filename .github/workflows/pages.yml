@@ -1,0 +1,55 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install wasm-opt
+        run: |
+          npm i -g binaryen
+          command -v wasm-opt
+          wasm-opt --version
+
+      - name: Build
+        run: node tools/build.ts
+
+      - name: Assemble Pages files
+        run: |
+          test -s dist/index.html
+          test -s dist/g.wasm
+          mkdir -p _site
+          cp dist/index.html dist/g.wasm .nojekyll _site/
+          test -s _site/index.html
+          test -s _site/g.wasm
+          test -f _site/.nojekyll
+
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./_site
+          publish_branch: gh-pages
