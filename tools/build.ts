@@ -14,7 +14,7 @@ if (wasmOpt) sh(`${wasmOpt} -Oz --enable-bulk-memory --enable-nontrapping-float-
 else copyFileSync(raw, root + 'dist/g.wasm');
 const wgsl = (f: string) => readFileSync(root + 'web/' + f, 'utf8').replace(/\/\/[^\n]*/g, '').replace(/\s+/g, ' ').replace(/ ?([{}();,:=<>+\-*\/&|^!?\[\]]) ?/g, '$1').replace(/>>/g, ' >> ').trim();
 const js = readFileSync(root + 'web/main.js', 'utf8').replace(/^\s*\/\/[^\n]*$/gm, '').replace(/\n\s+/g, '\n');
-const html = readFileSync(root + 'web/index.html', 'utf8').replace('/*SCENE*/', () => wgsl('scene.wgsl')).replace('/*BLIT*/', () => wgsl('blit.wgsl')).replace('/*MAIN*/', () => js).replace(/>\n</g, '><');
+const html = readFileSync(root + 'web/index.html', 'utf8').replace('/*SCENE*/', () => wgsl('scene.wgsl')).replace('/*BLIT*/', () => wgsl('blit.wgsl')).replace('/*HQ*/', () => wgsl('hq.wgsl')).replace('/*MAIN*/', () => js).replace(/>\n</g, '><');
 writeFileSync(root + 'dist/index.html', html);
 let gz = 0, br = 0;
 for (const f of ['index.html', 'g.wasm']) {

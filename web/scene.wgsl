@@ -14,6 +14,9 @@ const N = 128; const NZ = 16; const S = 8.; const ZW = 2.75; const CB = 15.5;
 const TR = 0.34; // trunk radius
 const SUN = vec3f(-0.5, 0.42, 0.757);
 const FOG = vec3f(0.761, 0.859, 0.941);
+// HQ lighting ('AAA shaders' setting): a pipeline-overridable constant. The standard pipeline is
+// built with HQ=false, so every `if (HQ)` block is dead code there and the classic look is untouched.
+override HQ = false;
 
 fn hh(a: u32) -> u32 { var n = a; n ^= n >> 16u; n *= 0x7feb352du; n ^= n >> 15u; n *= 0x846ca68bu; n ^= n >> 16u; return n; }
 fn h2(p: vec2i) -> f32 { return f32(hh((u32(p.x) * 1597334677u) ^ hh(u32(p.y) + 0x9e3779b9u)) >> 8u) / 16777216.; }
@@ -285,7 +288,7 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
   }
   let cloudCol = mix(cc, FOG, fogOn * smoothstep(far * 0.4, far, ct));
   // camera above the cloud layer: nothing can be in front of a cloud hit
-  if (ca > 0.5 && o.z > CB + 1.3) { return vec4f(cloudCol, 1.); }
+  if (ca > 0.5 && o.z > CB + 1.3) { if (HQ) { return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
   // ---- terrain: exact DDA through the block grid, then the avatar ----
   let tw = select(1e9, (ZW - o.z) / d.z, d.z < 0.);
   let tEnd = select(min(far, tw), min(ct, tw), ca > 0.5);
@@ -302,13 +305,14 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
     }
   }
   var col: vec3f; var tt = hb.t;
-  if (hb.id == 0u && ca > 0.5 && ct < tw) { return vec4f(cloudCol, 1.); }
+  if (hb.id == 0u && ca > 0.5 && ct < tw) { if (HQ) { return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
   if (hb.id == 0u) {
-    if (tw > far) { col = sky(d); tt = 0.; }
+    if (tw > far) { col = sky(d); tt = 0.; if (HQ) { col = hqSky(d); tt = far; } }
     else {
       tt = tw;
       let p = o + d * tw;
-      col = water(p.xy, shadow(vec3f((floor(p.xy * S) + .5) / S, ZW)));
+      if (HQ) { col = hqWater(p, d); }
+      else { col = water(p.xy, shadow(vec3f((floor(p.xy * S) + .5) / S, ZW))); }
     }
   } else {
     let p = o + d * hb.t; let n = hb.n;
@@ -317,7 +321,8 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
     let isLog = hb.id == 5u && !part;
     col = select(matCol(hb.id, ht, face), birch(p, n), isLog);
     var lit = 1.;
-    if (isLog) {
+    if (HQ) { col = hqShade(p, n, ht, hb.id, isLog, part, col); }
+    else if (isLog) {
       let ld = dot(n, SUN);
       lit = select(0., select(0.84, 1.0, ld > 0.45), ld > 0.05);
     } else if (face == 0) {
@@ -331,7 +336,7 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
       }
     } else if (n.z < -0.5) { lit = 0.5; }
     else { lit = select(0., 0.9, dot(n.xy, SUN.xy) > 0.); }
-    if (lit == 0.) {
+    if (HQ) { } else if (lit == 0.) {
       // face turned away from the sun: already in form shadow, use the shadow tint once
       col *= vec3f(0.64, 0.7, 0.84);
     } else {
@@ -347,10 +352,108 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
         let f = p - vec3f(cell); let e3 = min(f, 1. - f); var e = 1.;
         if (abs(n.x) < 0.5) { e = min(e, e3.x); } if (abs(n.y) < 0.5) { e = min(e, e3.y); } if (abs(n.z) < 0.5) { e = min(e, e3.z); }
         let pix = hb.t * 2. * U[0].w / U[0].y;
-        if (e < max(0.06, pix * 1.2)) { col = vec3f(0.07, 0.07, 0.1); } else { col = mix(col, vec3f(1.), 0.18); }
+        if (e < max(0.06, pix * 1.2)) { col = vec3f(0.07, 0.07, 0.1); } else { col = select(mix(col, vec3f(1.), 0.18), col * 1.5 + 0.02, HQ); }
       }
     }
   }
+  if (HQ) { return vec4f(hqAtmo(o, d, tt, far, fogOn, col, fc.xy), 1.); }
   col = mix(col, FOG, fogOn * smoothstep(far * 0.35, far, tt));
   return vec4f(col, 1.);
+}
+
+// ======================= HQ lighting (only reachable when HQ = true) =======================
+// Linear-ish HDR: palette colours are squared (gamma 2), lit by sun + sky + one bounce,
+// tonemapped (ACES fit) and square-rooted again in hq.wgsl. Sun: U[18] dir, U[19] colour,
+// U[7].yzw sky ambient. All lookups stay on the voxel grid so it keeps the pixel-art look.
+fn lin(c: vec3f) -> vec3f { return c * c; }
+fn sunL() -> vec3f { return U[18].xyz; }
+fn occ(b: vec3i) -> f32 { let i = block(b); return select(0., 1., i != 0u && i != 5u); }
+// Minecraft-style per-voxel AO: the 8 cells around the face's air cell, bilinear over the face
+fn hqAO(c: vec3i, n: vec3f, p: vec3f) -> f32 {
+  let a = c + vec3i(round(n));
+  var u = vec3i(1, 0, 0); var v = vec3i(0, 1, 0);
+  if (abs(n.x) > 0.5) { u = vec3i(0, 1, 0); v = vec3i(0, 0, 1); } else if (abs(n.y) > 0.5) { v = vec3i(0, 0, 1); }
+  let l = (floor((p - vec3f(c)) * S) + .5) / S;           // texel-quantised position on the face
+  let f = vec2f(dot(l, vec3f(u)), dot(l, vec3f(v)));
+  let xm = occ(a - u); let xp = occ(a + u); let ym = occ(a - v); let yp = occ(a + v);
+  let c00 = 3. - select(xm + ym + occ(a - u - v), 3., xm + ym > 1.5);
+  let c10 = 3. - select(xp + ym + occ(a + u - v), 3., xp + ym > 1.5);
+  let c01 = 3. - select(xm + yp + occ(a - u + v), 3., xm + yp > 1.5);
+  let c11 = 3. - select(xp + yp + occ(a + u + v), 3., xp + yp > 1.5);
+  return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y) / 3.;
+}
+// soft sun shadow: 3 rays in a small cone (rotated per texel), so it is sharp at contact and
+// widens with blocker distance; clouds cast a translucent shadow
+fn hqShadow(p: vec3f, k: f32) -> f32 {
+  let L = sunL(); if (L.z < 0.02) { return 0.; }
+  let t1 = normalize(cross(L, vec3f(0., 0., 1.))); let t2 = cross(L, t1); var v = 0.;
+  for (var i = 0; i < 3; i++) {
+    let a = (f32(i) + k) * 2.0944; let r = normalize(L + (t1 * cos(a) + t2 * sin(a)) * 0.075);
+    if (traceBlocks(p, r, 0., 16., 28).id == 0u && tracePlayer(p, r, 16.).id == 0u) { v += 1.; }
+  }
+  let qc = p.xy + L.xy * ((CB + 0.6 - p.z) / L.z);
+  return v / 3. * select(1., 0.3, cloud((floor(qc * S) + .5) / S) > 0.);
+}
+fn hqSky(d: vec3f) -> vec3f {
+  let L = sunL(); let sc = U[19].xyz; let mu = max(dot(d, L), 0.);
+  let hz = lin(FOG) * U[19].w + sc * 0.12 * pow(max(dot(normalize(d.xy + 1e-5), normalize(L.xy + 1e-5)), 0.), 3.) * (1. - U[19].w * 0.7);
+  var c = mix(hz, U[7].yzw * vec3f(1., 1.5, 2.3), sqrt(clamp(d.z, 0., 1.)));
+  c += sc * (pow(mu, 32.) * 0.15 + select(0., 12., mu > 0.9993));   // halo + sun disc (blooms)
+  return c;
+}
+// lights a palette colour on a surface (shared by direct hits and reflections)
+fn hqLight(alb: vec3f, n: vec3f, ao: f32, sh: f32, gnd: vec3f) -> vec3f {
+  let ndl = max(dot(n, sunL()), 0.);
+  return alb * (U[19].xyz * ndl * sh + U[7].yzw * ao * (1.5 - 0.3 * n.z) + gnd * U[19].xyz * ao * (0.5 - 0.5 * n.z));
+}
+fn hqShade(p: vec3f, n: vec3f, ht: vec3i, id: u32, isLog: bool, part: bool, base: vec3f) -> vec3f {
+  let c = vec3i(floor(p - n * 0.002));
+  var ao = 1.; if (!part && !isLog && id < 10u) { ao = 0.25 + 0.75 * hqAO(c, n, p); }
+  var sh = 0.;
+  if (dot(n, sunL()) > 0.) {
+    let q = select((vec3f(ht) + .5) / S + n * (0.5 / S + 0.01), p + n * 0.03, isLog);
+    sh = hqShadow(q, h3(ht));
+  }
+  // one cheap bounce: colour of the ground in front of / below the face (green from grass, blue water)
+  var g = block(c + vec3i(round(n)) - vec3i(0, 0, 1));
+  if (g == 0u) { g = block(c + vec3i(round(n)) - vec3i(0, 0, 2)); }
+  let gc = select(lin(matCol(g, vec3i(4), 0)), vec3f(0.06, 0.2, 0.45), g == 0u);
+  return hqLight(lin(base), n, ao, sh, gc * 0.6);
+}
+fn hqWater(p: vec3f, d: vec3f) -> vec3f {
+  let tq = (floor(p.xy * S) + .5) / S; let tm = U[0].z;
+  let sh = hqShadow(vec3f(tq, ZW), 0.5);
+  let base = lin(water(p.xy, 1.));           // palette: depth tint, foam, sparkles (refraction tint)
+  let wn = normalize(vec3f(vn(tq * 1.7 + tm * 0.7) - .5, vn(tq.yx * 1.3 - tm * 0.6) - .5, 9.));
+  let r = reflect(d, wn);
+  var rc = hqSky(r);
+  let h = traceBlocks(vec3f(tq, ZW + 0.01), r, 0., 40., 64);
+  if (h.id != 0u) {
+    let q = vec3f(tq, ZW) + r * h.t;
+    let a = select(matCol(h.id, vec3i(floor((q - h.n * 0.002) * S)), select(1, 0, h.n.z > 0.5)), birch(q, h.n), h.id == 5u);
+    rc = hqLight(lin(a), h.n, 0.8, 0.85, vec3f(0.));
+  }
+  let fr = 0.03 + 0.6 * pow(1. - abs(d.z), 5.);
+  var c = mix(base * (U[7].yzw * 0.9 + U[19].xyz * (0.2 + 0.25 * sh)), rc, fr);
+  return c + U[19].xyz * pow(max(dot(r, sunL()), 0.), 900.) * 8. * sh;   // sun glint
+}
+fn hqCloud(cc: vec3f, t: f32, o: vec3f, d: vec3f) -> vec3f {
+  let c = lin(cc) * (U[19].xyz * 1.1 + U[7].yzw * 0.6);
+  return mix(c, hqSky(d), smoothstep(U[2].w * 0.4, U[2].w, t) * U[1].w);
+}
+// aerial perspective + light shafts: a few dithered samples along the view ray test the cloud
+// shadow (and terrain under the sample), in-scatter ~ sun phase; distance fades into the sky
+fn hqAtmo(o: vec3f, d: vec3f, tt: f32, far: f32, fogOn: f32, col: vec3f, fc: vec2f) -> vec3f {
+  let L = sunL(); let len = min(tt, 56.); let j = bayer4(vec2i(floor(fc)));
+  var vis = 0.;
+  for (var k = 0; k < 6; k++) {
+    let q = o + d * (len * (f32(k) + j) / 6.);
+    let qc = q.xy + L.xy * ((CB + 0.6 - q.z) / max(L.z, 0.05));
+    let lit = q.z > f32(height(vec2i(floor(q.xy)))) && (q.z > CB || cloud((floor(qc * S) + .5) / S) <= 0.);
+    vis += select(0., 1., lit);
+  }
+  let ph = 0.35 + 2.2 * pow(max(dot(d, L), 0.), 8.);
+  let dens = 1. - exp(-len * 0.006);
+  var c = col + U[19].xyz * (vis / 6.) * ph * dens * 0.06 + U[7].yzw * dens * 0.02;
+  return mix(c, hqSky(d), fogOn * smoothstep(far * 0.35, far, tt));
 }

@@ -40,19 +40,31 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   };
   const ub = dev.createBuffer({ size: 320, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const bb = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  const mk = (code, f) => { const m = dev.createShaderModule({ code }); m.getCompilationInfo?.().then((i) => i.messages.forEach((x) => console.warn(x.type, x.lineNum, x.message))); return dev.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: 'fs', targets: [{ format: f }] } }); };
+  const mk = (code, f, e = 'fs', c) => { const m = dev.createShaderModule({ code }); m.getCompilationInfo?.().then((i) => i.messages.forEach((x) => console.warn(x.type, x.lineNum, x.message))); return dev.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: e, constants: c, targets: [{ format: f }] } }); };
   const scene = mk(SCENE_WGSL, 'rgba8unorm'), blit = mk(BLIT_WGSL, fmt);
-  let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = 115000, cross = 0;
+  // HQ setting: same scene shader with the HQ override on (HDR target) + bloom + tonemap passes.
+  // Built and allocated only when HQ is switched on; standard mode never touches any of it.
+  const fxq = qs.get('fx'); let hq = fxq != null ? fxq === '1' : localStorage.getItem('m7c-fx') === '1';
+  const tq = qs.get('tod'); let tod = tq != null ? (isNaN(+tq) ? tq : +tq) : localStorage.getItem('m7c-tod') || 'day', Q = null, bt, lt, bgB, bgO;
+  const hqP = () => Q ||= { scene: mk(SCENE_WGSL, 'rgba16float', 'fs', { HQ: 1 }), bloom: mk(HQ_WGSL, 'rgba16float', 'fb'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
+  const bgr = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map((resource, binding) => ({ binding, resource })) });
+  let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = +qs.get("area") || (hq ? 70000 : 115000), cross = 0;
   const resize = () => {
     const d = Math.min(devicePixelRatio || 1, 3);
     W = Math.max(1, Math.round(innerWidth * d)); H = Math.max(1, Math.round(innerHeight * d));
     cv.width = W; cv.height = H;
     px = Math.max(1, Math.round(Math.sqrt(W * H / AREA)));
     iw = Math.ceil(W / px); ih = Math.ceil(H / px);
-    rt?.destroy();
-    rt = dev.createTexture({ size: [iw, ih], format: 'rgba8unorm', usage: T.RENDER_ATTACHMENT | T.TEXTURE_BINDING });
-    sg = dev.createBindGroup({ layout: scene.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ub } }, { binding: 1, resource: vox.createView() }, { binding: 2, resource: hm.createView() }] });
-    bg = dev.createBindGroup({ layout: blit.getBindGroupLayout(0), entries: [{ binding: 0, resource: rt.createView() }, { binding: 1, resource: { buffer: bb } }] });
+    rt?.destroy(); bt?.destroy(); lt?.destroy(); bt = lt = null;
+    const u = T.RENDER_ATTACHMENT | T.TEXTURE_BINDING;
+    rt = dev.createTexture({ size: [iw, ih], format: hq ? 'rgba16float' : 'rgba8unorm', usage: u });
+    sg = bgr(hq ? hqP().scene : scene, [{ buffer: ub }, vox.createView(), hm.createView()]);
+    if (hq) {
+      bt = dev.createTexture({ size: [Math.ceil(iw / 4), Math.ceil(ih / 4)], format: 'rgba16float', usage: u });
+      lt = dev.createTexture({ size: [iw, ih], format: 'rgba8unorm', usage: u });
+      bgB = bgr(Q.bloom, [rt.createView()]); bgO = bgr(Q.out, [rt.createView(), bt.createView(), Q.sm]);
+    }
+    bg = bgr(blit, [(lt || rt).createView(), { buffer: bb }]);
     dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, 0, 0]));
   };
   addEventListener('resize', resize); resize();
@@ -112,9 +124,9 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
 
   // ---------- hints ----------
   const HINTS = {
-    kb: (f) => f ? 'WASD move \u00b7 click: lock mouse \u00b7 LMB break \u00b7 RMB place \u00b7 1-7/wheel block \u00b7 space jump \u00b7 V view'
-      : 'WASD move \u00b7 drag: look \u00b7 click break \u00b7 right-click place \u00b7 X/C break/place ahead \u00b7 1-7 block \u00b7 wheel zoom \u00b7 V view',
-    pad: (f) => `L-stick move \u00b7 R-stick look \u00b7 RT break \u00b7 LT place \u00b7 D-pad \u2190\u2192 block${f ? '' : ' \u00b7 LB/RB zoom'} \u00b7 A jump \u00b7 Y view`,
+    kb: (f) => f ? 'WASD move \u00b7 click: lock mouse \u00b7 LMB break \u00b7 RMB place \u00b7 1-7/wheel block \u00b7 space jump \u00b7 V view \u00b7 G settings'
+      : 'WASD move \u00b7 drag: look \u00b7 click break \u00b7 right-click place \u00b7 X/C break/place ahead \u00b7 1-7 block \u00b7 wheel zoom \u00b7 V view \u00b7 G settings',
+    pad: (f) => `L-stick move \u00b7 R-stick look \u00b7 RT break \u00b7 LT place \u00b7 D-pad \u2190\u2192 block${f ? '' : ' \u00b7 LB/RB zoom'} \u00b7 A jump \u00b7 Y view \u00b7 \u2630 settings`,
     touch: (f) => f ? 'stick move \u00b7 drag look \u00b7 tap / \u25cf: ' + (placeMode ? 'place' : 'break') + ' \u00b7 hold: place \u00b7 VIEW' : 'stick move \u00b7 drag look \u00b7 tap block: ' + (placeMode ? 'place' : 'break') + ' \u00b7 hold: place \u00b7 pinch zoom',
   };
   const setHint = () => {
@@ -128,10 +140,36 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     if (!VIEWS[view].fps && document.pointerLockElement) document.exitPointerLock();
   };
 
+  // ---------- settings panel: Grafik Standard/HQ, Tid (HQ sun) ----------
+  const panel = $('#s'); let row = 0;
+  const opened = () => panel.classList.contains('on');
+  const syncPanel = () => {
+    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String(e.dataset.k === 'fx' ? +hq : tod)));
+    panel.querySelectorAll('p').forEach((e, i) => e.classList.toggle('f', i === row));
+  };
+  const setOpt = (k, v) => {
+    if (k === 'fx') { if (hq !== (v === '1')) { hq = v === '1'; localStorage.setItem('m7c-fx', +hq); AREA = hq ? 70000 : 115000; slow = 0; resize(); } }
+    else { tod = v; localStorage.setItem('m7c-tod', v); }
+    syncPanel();
+  };
+  const togglePanel = () => { if (panel.classList.toggle('on') && document.pointerLockElement) document.exitPointerLock(); syncPanel(); };
+  const stepOpt = (dir) => { const o = [...panel.querySelectorAll('p')[row].children], i = o.findIndex((e) => e.classList.contains('on')), e = o[(i + dir + o.length) % o.length]; setOpt(e.dataset.k, e.dataset.v); };
+  const moveRow = (dir) => { row = (row + dir + 2) % 2; syncPanel(); };
+  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = d.k === 'fx' ? 0 : 1; setOpt(d.k, d.v); } });
+  $('#g').addEventListener('click', togglePanel);
+  for (const el of [panel, $('#g')]) el.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
+  syncPanel();
+
   // ---------- keyboard + mouse ----------
   let jumpQ = false;
   addEventListener('keydown', (e) => {
-    setMode('kb'); keys.add(e.code);
+    setMode('kb');
+    if (e.code === 'KeyG' && !e.repeat) return togglePanel();
+    if (opened()) {
+      const m = { ArrowUp: () => moveRow(-1), ArrowDown: () => moveRow(1), ArrowLeft: () => stepOpt(-1), ArrowRight: () => stepOpt(1), Enter: () => stepOpt(1), Escape: togglePanel }[e.code];
+      if (m) { m(); e.preventDefault(); return; }
+    }
+    keys.add(e.code);
     if (e.repeat) return;
     if (e.code === 'KeyV') toggleView();
     if (e.code === 'Space') { jumpQ = true; e.preventDefault(); }
@@ -231,8 +269,30 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   if (qs.get('p')) { const [x, y] = qs.get('p').split(',').map(Number); const hm8 = new Uint8Array(mem(), X.height_ptr(), N * N); st[0] = x + 0.5; st[1] = y + 0.5; st[2] = hm8[y * N + x] + 2; }
   if (qs.get('pt')) pitch = +qs.get('pt');
   const t0 = +qs.get('t') || 0;
+  // HQ sun: 'day' = the classic fixed sun; 'eve' = golden hour; 'cyc' = 4 min day/night; ?tod=hours
+  const sm = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+  const sun = (time) => {
+    const h = tod === 'day' ? 14 : tod === 'eve' ? 17.4 : tod === 'cyc' ? (14 + time / 10) % 24 : tod;
+    const a = (h - 6) / 12 * Math.PI, el = Math.asin(0.866 * Math.sin(a)), az = 2.44 + (h - 14) * 0.26;
+    let d = tod === 'day' ? [-0.5, 0.42, 0.757] : [Math.cos(az) * Math.cos(el), Math.sin(az) * Math.cos(el), Math.sin(el)];
+    const z = d[2], k = sm(-0.02, 0.45, z), n = z < -0.06;
+    const mx = (p, q, t) => p.map((x, i) => x + (q[i] - x) * t);
+    if (n) d = d.map((x) => -x);   // night: the moon, opposite the sun
+    const c = n ? [0.12, 0.16, 0.3] : mx([1.0, 0.36, 0.1], [1.5, 1.44, 1.32], k).map((x) => x * sm(-0.06, 0.06, z));
+    const sky = n ? [0.015, 0.025, 0.06] : mx([0.1, 0.1, 0.16], [0.17, 0.23, 0.33], k).map((x) => x * (0.25 + 0.75 * sm(-0.1, 0.2, z)));
+    return [d, c, sky, n ? 0.06 : 0.12 + 0.88 * sm(-0.05, 0.3, z)];
+  };
   cz = st[2];
-  window.m7 = { act, target, setSlot, X, edits, save, get view() { return view; } }; // handy for tests
+  const pass = (enc, v, pl, g) => { const p = enc.beginRenderPass({ colorAttachments: [{ view: v.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] }); p.setPipeline(pl); p.setBindGroup(0, g); p.draw(3); p.end(); };
+  const draw = () => {
+    const enc = dev.createCommandEncoder();
+    pass(enc, rt, hq ? Q.scene : scene, sg);
+    if (hq) { pass(enc, bt, Q.bloom, bgB); pass(enc, lt, Q.out, bgO); }
+    pass(enc, ctx.getCurrentTexture(), blit, bg);
+    dev.queue.submit([enc.finish()]);
+  };
+  // test hook: mean GPU frame time (ms) over n frames, each awaited to completion
+  const bench = async (n) => { await dev.queue.onSubmittedWorkDone(); const t = Date.now(); for (let i = 0; i < n; i++) { draw(); await dev.queue.onSubmittedWorkDone(); } return { ms: (Date.now() - t) / n, iw, ih, hq }; };
   const frame = (now) => {
     const dt = Math.min(0.05, (now - last) / 1000); last = now;
     let mx = 0, my = 0, jump = jumpQ; jumpQ = false;
@@ -250,10 +310,13 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
       mx += lx; my -= ly; look(rx * 2.6 * dt, ry * 1.6 * dt);
       if (b(0) && !prevBtn[0]) jump = true;
       if (b(3) && !prevBtn[3]) toggleView();
-      if (b(1) || b(10)) run = true;
+      if ((b(1) && !opened()) || b(10)) run = true;
       // LB/RB zoom, D-pad left/right hotbar, RT break / LT place (auto-repeat while held)
       zoom = Math.min(2.6, Math.max(0.45, zoom * (1 + ((b(4) ? 1 : 0) - (b(5) ? 1 : 0)) * dt * 1.5)));
-      if (b(14) && !prevBtn[14]) setSlot(slot - 1); if (b(15) && !prevBtn[15]) setSlot(slot + 1);
+      const pr = (i) => b(i) && !prevBtn[i];
+      if (pr(9)) togglePanel();   // Start/Menu: settings; while open the D-pad edits it, B closes
+      if (opened()) { if (pr(12)) moveRow(-1); if (pr(13)) moveRow(1); if (pr(14)) stepOpt(-1); if (pr(15)) stepOpt(1); if (pr(1)) togglePanel(); }
+      else { if (pr(14)) setSlot(slot - 1); if (pr(15)) setSlot(slot + 1); }
       for (const [k, bi, pl] of [[0, 7, false], [1, 6, true]]) {
         if (v(bi) > 0.5) { if ((trig[k] -= dt) <= 0) { act(target(VIEWS[view].fps ? 'center' : 'front'), pl); trig[k] = 0.25; } } else trig[k] = 0;
       }
@@ -281,20 +344,17 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     U.fill(0);
     U.set([iw, ih, now / 1000 + t0, tanV, ...cam.o, V.fog, ...F, far, ...R, iw / ih, ...Up, 0, st[0], st[1], st[2], 0, st[4], st[5], st[6], st[7], V.fps ? 1 : 0, 0, 0, 0]);
     if (hl) U.set([...hl.b, 1], 32);
+    if (hq) { const [d, c, sky, w] = sun(now / 1000 + t0); U.set(sky, 29); U.set([...d, 0, ...c, w], 72); }
     if (parts.length) { U.set([partId, 1], 36); parts.forEach((q, i) => U.set([...q.p, q.life > 0 ? 0.07 + 0.08 * Math.min(1, q.life * 2) : 0], 40 + i * 4)); }
     if ((V.fps | 0) !== cross) { cross = V.fps | 0; dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, 0, 0])); }
     dev.queue.writeBuffer(ub, 0, U);
-    const enc = dev.createCommandEncoder();
-    let p = enc.beginRenderPass({ colorAttachments: [{ view: rt.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] });
-    p.setPipeline(scene); p.setBindGroup(0, sg); p.draw(3); p.end();
-    p = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] });
-    p.setPipeline(blit); p.setBindGroup(0, bg); p.draw(3); p.end();
-    dev.queue.submit([enc.finish()]);
+    draw();
     // adaptive resolution: drop internal pixels if we can't hold ~45fps
     acc += dt; frames++;
-    if (acc > 1) { if (acc / frames > 0.022 && AREA > 45000) { if (++slow >= 2) { AREA *= 0.75; resize(); slow = 0; } } else slow = 0; acc = 0; frames = 0; }
+    if (acc > 1) { if (acc / frames > 0.022 && AREA > (hq ? 25000 : 45000)) { if (++slow >= 2) { AREA *= 0.75; resize(); slow = 0; } } else slow = 0; acc = 0; frames = 0; }
     requestAnimationFrame(frame);
   };
+  window.m7 = { act, target, setSlot, X, edits, save, bench, setOpt, togglePanel, get view() { return view; } }; // handy for tests
   $('#l').remove();
   requestAnimationFrame(frame);
 })().catch((e) => fail('Failed to start: ' + e.message));

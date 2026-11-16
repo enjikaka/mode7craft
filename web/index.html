@@ -18,10 +18,16 @@ html,body{margin:0;height:100%;overflow:hidden;background:#2f5bc4;touch-action:n
 #m{bottom:calc(196px + env(safe-area-inset-bottom));width:56px;height:30px;border-radius:6px;font-size:10px}
 #a{display:none;bottom:calc(46px + env(safe-area-inset-bottom));right:calc(96px + env(safe-area-inset-right));font-size:20px}
 #j{bottom:calc(46px + env(safe-area-inset-bottom))}#v{bottom:calc(124px + env(safe-area-inset-bottom));width:48px;height:48px;right:calc(26px + env(safe-area-inset-right));font-size:11px}
+#g{position:fixed;top:calc(8px + env(safe-area-inset-top));right:calc(8px + env(safe-area-inset-right));width:34px;height:34px;color:#fff3b0;background:rgba(18,22,38,.55);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:5}
+#s{display:none;position:fixed;top:calc(48px + env(safe-area-inset-top));right:calc(8px + env(safe-area-inset-right));background:rgba(18,22,38,.85);color:#fff3b0;font:700 10px/1 ui-monospace,Menlo,monospace;letter-spacing:1px;text-transform:uppercase;padding:8px 10px;z-index:5}
+#s.on{display:block}#s p{margin:7px 0 0;display:flex;align-items:center;gap:4px;padding:2px;border:1px solid transparent}#s p.f{border-color:rgba(255,243,176,.35)}#s p b{width:66px;white-space:nowrap}
+#s i{font-style:normal;padding:5px 7px;border:2px solid rgba(255,243,176,.35);cursor:pointer}#s i.on{background:#fff3b0;color:#12162a;border-color:#fff3b0}
 </style></head><body>
 <canvas id="c"></canvas><div id="l">LOADING</div><div id="e"></div><div id="h"></div>
 <div id="t"><div id="b"><div id="k"></div></div><div class="bt" id="j" data-btn="1">JUMP</div><div class="bt" id="v" data-btn="1">VIEW</div><div class="bt" id="m" data-btn="1">BREAK</div><div class="bt" id="a" data-btn="1">&#9679;</div></div><div id="hb"></div>
+<div id="g" title="Inställningar (G / Start)"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="7.5" stroke-width="4" stroke-dasharray="3.3 2.6"/><circle cx="12" cy="12" r="4" stroke-width="2.5"/></svg></div>
+<div id="s">Inställningar<p><b>Grafik</b><i data-k="fx" data-v="0">Standard</i><i data-k="fx" data-v="1">HQ</i></p><p><b>Tid (HQ)</b><i data-k="tod" data-v="day">Dag</i><i data-k="tod" data-v="eve">Kväll</i><i data-k="tod" data-v="cyc">Cykel</i></p></div>
 <script type="module">
-const SCENE_WGSL=`/*SCENE*/`;const BLIT_WGSL=`/*BLIT*/`;
+const SCENE_WGSL=`/*SCENE*/`;const BLIT_WGSL=`/*BLIT*/`;const HQ_WGSL=`/*HQ*/`;
 /*MAIN*/
 </script></body></html>
