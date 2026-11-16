@@ -59,6 +59,19 @@ fn vn(p: vec2f) -> f32 {
   return mix(mix(h2(i), h2(i + vec2i(1, 0)), u.x), mix(h2(i + vec2i(0, 1)), h2(i + vec2i(1, 1)), u.x), u.y);
 }
 // sparse puffy clouds: a few domes per 12-block cell, returns stack height in slices
+// which 12-block cloud cell (= one cloud cluster; domes never leave their cell) covers p
+fn cloudCell(p: vec2f) -> vec2i { return vec2i(floor((p + vec2f(U[0].z * 0.9, U[0].z * 0.3)) / 12.)); }
+// cell of the cloud a segment from the camera to point e crosses (its cloud base), or a sentinel
+fn occCell(o: vec3f, e: vec3f) -> vec2i {
+  if (o.z <= CB || e.z >= CB) { return vec2i(-99999); }
+  let q = mix(o.xy, e.xy, (o.z - CB) / (o.z - e.z));
+  return select(vec2i(-99999), cloudCell(q), cloud(q) > 0.);
+}
+fn bayer4(p: vec2i) -> f32 {
+  let x = u32(p.x) & 3u; let y = u32(p.y) & 3u;
+  let m = array<u32, 16>(0u, 8u, 2u, 10u, 12u, 4u, 14u, 6u, 3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u);
+  return (f32(m[y * 4u + x]) + 0.5) / 16.;
+}
 fn cloud(p: vec2f) -> f32 {
   let w = p + vec2f(U[0].z * 0.9, U[0].z * 0.3);
   let c = vec2i(floor(w / 12.));
@@ -202,41 +215,52 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
   let o = U[1].xyz; let F = U[2].xyz; let R = U[3].xyz; let Up = U[4].xyz;
   let d = normalize(F + R * nd.x + Up * nd.y);
   let far = U[2].w; let fogOn = U[1].w;
-  if (d.z > -0.002) { return vec4f(sky(d), 1.); }
-  // ---- clouds: stacked blob slices above the terrain ----
+  let fps = U[7].x > 0.5; let up = d.z > 0.;
+  // ---- clouds: stacked blob slices (walked top-down, or bottom-up when looking up) ----
   var cc = vec3f(1.); var ca = 0.; var ct = 0.;
+  if (abs(d.z) > 1e-4) {
   for (var k = 0; k < 10; k++) {
-    let j = 9 - k; let z = CB + f32(j + 1) / S; let t = (z - o.z) / d.z;
+    let j = select(9 - k, k, up); let z = CB + f32(select(j + 1, j, up)) / S; let t = (z - o.z) / d.z;
     if (t < 0.) { continue; } if (t > far) { break; }
     let q = (floor((o.xy + d.xy * t) * S) + .5) / S;
     let th = cloud(q);
     if (th > f32(j)) {
-      // puffy: white tops, cool blue-grey rim on the lower side
-      if (th >= f32(j + 1) && j < 9) { cc = select(select(vec3f(0.97, 0.98, 1.), vec3f(0.86, 0.9, 0.96), j < 4), vec3f(0.73, 0.8, 0.91), j < 2); }
+      if (up && j == 0) { cc = select(vec3f(0.8, 0.85, 0.94), vec3f(0.74, 0.8, 0.91), h2(vec2i(floor(q * S))) > 0.85); }   // underside seen from below
+      else if (th >= f32(j + 1) && j < 9) { cc = select(select(vec3f(0.97, 0.98, 1.), vec3f(0.86, 0.9, 0.96), j < 4), vec3f(0.73, 0.8, 0.91), j < 2); }
       else if (h2(vec2i(floor(q * S))) > 0.9) { cc = vec3f(0.94, 0.96, 1.); }
-      // See-through, consistent in every view: fade clouds that cover the avatar's
-      // projected screen neighbourhood, clouds right above it, and clouds near the camera.
-      let pc = U[5].xyz + vec3f(0., 0., 0.9); let v = pc - o; let pd = length(v);
-      let dep = max(dot(v, F), 0.1);
-      let pnd = vec2f(dot(v, R), dot(v, Up)) / dep;
-      let rr = 1.2 / dep;                                   // avatar radius in view-plane units
-      var a = smoothstep(rr * 1.6, rr * 4.5, length(nd - pnd));
-      a = select(a, 1., t > pd);                            // behind the avatar: never occludes
-      a = min(a, smoothstep(3., 7., length(q - pc.xy)));    // avatar standing under it
-      a *= smoothstep(0.12, 0.4, t / pd);                   // big near-camera clouds
-      ca = a; ct = t;
+      // Retro see-through: the WHOLE cloud cluster that hides the avatar (camera->head/centre/feet
+      // crosses its base) or that it stands under is drawn at a uniform ~50% with a screen-stable
+      // 4x4 Bayer dither. Near-camera clouds step down in quantised dither levels. No soft halo.
+      var a = 1.;
+      if (!fps) {
+        let P = U[5].xyz; let cell = cloudCell(q);
+        let pc = P + vec3f(0., 0., 0.9);
+        var hit = cloud(P.xy) > 0. && all(cell == cloudCell(P.xy));
+        // 3x3 samples over the avatar's silhouette (+margin), across the view: feet/centre/head x left/mid/right
+        for (var i = 0; i < 9 && !hit; i++) {
+          let e = P + R * (f32(i % 3) - 1.) * 0.9 + vec3f(0., 0., f32(i / 3) * 1.);
+          hit = all(cell == occCell(o, e));
+        }
+        if (hit) { a = 0.5; }
+        a = min(a, ceil(smoothstep(0.1, 0.45, t / length(pc - o)) * 4.) / 4.);
+      }
+      if (bayer4(vec2i(floor(fc.xy))) < a) { ca = 1.; ct = t; }
       break;
     }
   }
-  if (ca > 0.995) { return vec4f(mix(cc, FOG, fogOn * smoothstep(far * 0.4, far, ct)), 1.); }
+  }
+  let cloudCol = mix(cc, FOG, fogOn * smoothstep(far * 0.4, far, ct));
+  // camera above the cloud layer: nothing can be in front of a cloud hit
+  if (ca > 0.5 && o.z > CB + 1.3) { return vec4f(cloudCol, 1.); }
   // ---- terrain: exact DDA through the block grid, then the avatar ----
-  let tw = (ZW - o.z) / d.z;
-  var hb = traceBlocks(o, d, 0., min(far, tw), 320);
-  let hp = tracePlayer(o, d, hb.t);
-  if (hp.id != 0u) { hb = hp; }
+  let tw = select(1e9, (ZW - o.z) / d.z, d.z < 0.);
+  let tEnd = select(min(far, tw), min(ct, tw), ca > 0.5);
+  var hb = traceBlocks(o, d, 0., tEnd, 320);
+  if (!fps) { let hp = tracePlayer(o, d, hb.t); if (hp.id != 0u) { hb = hp; } }
   var col: vec3f; var tt = hb.t;
+  if (hb.id == 0u && ca > 0.5 && ct < tw) { return vec4f(cloudCol, 1.); }
   if (hb.id == 0u) {
-    if (tw > far) { col = sky(d); }
+    if (tw > far) { col = sky(d); tt = 0.; }
     else {
       tt = tw;
       let p = o + d * tw;
@@ -270,6 +294,5 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
     }
   }
   col = mix(col, FOG, fogOn * smoothstep(far * 0.35, far, tt));
-  if (ca > 0.) { col = mix(col, mix(cc, FOG, fogOn * smoothstep(far * 0.4, far, ct)), ca); }
   return vec4f(col, 1.);
 }

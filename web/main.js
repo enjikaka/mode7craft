@@ -28,7 +28,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const bb = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const mk = (code, f) => { const m = dev.createShaderModule({ code }); m.getCompilationInfo?.().then((i) => i.messages.forEach((x) => console.warn(x.type, x.lineNum, x.message))); return dev.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: 'fs', targets: [{ format: f }] } }); };
   const scene = mk(SCENE_WGSL, 'rgba8unorm'), blit = mk(BLIT_WGSL, fmt);
-  let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = 115000;
+  let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = 115000, cross = 0;
   const resize = () => {
     const d = Math.min(devicePixelRatio || 1, 3);
     W = Math.max(1, Math.round(innerWidth * d)); H = Math.max(1, Math.round(innerHeight * d));
@@ -39,28 +39,33 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     rt = dev.createTexture({ size: [iw, ih], format: 'rgba8unorm', usage: T.RENDER_ATTACHMENT | T.TEXTURE_BINDING });
     sg = dev.createBindGroup({ layout: scene.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ub } }, { binding: 1, resource: vox.createView() }, { binding: 2, resource: hm.createView() }] });
     bg = dev.createBindGroup({ layout: blit.getBindGroupLayout(0), entries: [{ binding: 0, resource: rt.createView() }, { binding: 1, resource: { buffer: bb } }] });
-    dev.queue.writeBuffer(bb, 0, new Float32Array([px, 0, 0, 0]));
+    dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, 0, 0]));
   };
   addEventListener('resize', resize); resize();
 
   // ---------- camera + input ----------
-  const VIEWS = [{ pitch: 0.62, tan: 0.27, dist: 30, fog: 1 }, { pitch: 1.2, tan: 0.13, dist: 105, fog: 0 }];
+  // views cycle: chase -> first person -> top-down
+  const VIEWS = [
+    { name: 'chase', pitch: 0.62, tan: 0.27, dist: 30, fog: 1, lo: 0.3, hi: 1.45 },
+    { name: 'first person', pitch: 0.08, tan: 0.62, dist: 0, fog: 1, lo: -1.45, hi: 1.45, fps: 1 },
+    { name: 'top-down', pitch: 1.2, tan: 0.13, dist: 105, fog: 0, lo: 0.3, hi: 1.45 }];
   const qs = new URLSearchParams(location.search);
-  let view = +qs.get('v') & 1, yaw = Math.PI / 2 + (+qs.get('r') || 0), pitch = VIEWS[view].pitch, zoom = +qs.get('z') || 1, cz = 0, mode = 'kb', run = false;
+  let view = (+qs.get('v') || 0) % 3, yaw = Math.PI / 2 + (+qs.get('r') || 0), pitch = VIEWS[view].pitch, zoom = +qs.get('z') || 1, cz = 0, mode = 'kb', run = false;
   const keys = new Set();
-  const setMode = (m) => { if (m === mode) return; mode = m; hint.textContent = HINTS[m]; $('#t').style.display = m === 'touch' ? 'block' : 'none'; };
   const HINTS = {
-    kb: 'WASD move \u00b7 click + mouse to look \u00b7 Q/E turn \u00b7 wheel zoom \u00b7 space jump \u00b7 shift run \u00b7 V view',
-    pad: 'L-stick move \u00b7 R-stick look \u00b7 A jump \u00b7 B run \u00b7 Y view \u00b7 LT/RT zoom \u00b7 LB/RB turn',
-    touch: 'left: move \u00b7 drag right: look \u00b7 pinch: zoom',
+    kb: (f) => `WASD move \u00b7 click + mouse look \u00b7 ${f ? '' : 'Q/E turn \u00b7 wheel zoom \u00b7 '}space jump \u00b7 shift run \u00b7 V view`,
+    pad: (f) => `L-stick move \u00b7 R-stick look \u00b7 A jump \u00b7 B run \u00b7 Y view${f ? '' : ' \u00b7 LT/RT zoom \u00b7 LB/RB turn'}`,
+    touch: (f) => `left: move \u00b7 drag right: look${f ? '' : ' \u00b7 pinch: zoom'} \u00b7 VIEW: switch`,
   };
-  hint.textContent = HINTS.kb;
-  const toggleView = () => { view ^= 1; pitch = VIEWS[view].pitch; };
+  const setHint = () => { hint.textContent = `[${VIEWS[view].name}] ` + HINTS[mode](VIEWS[view].fps); };
+  const setMode = (m) => { if (m === mode) return; mode = m; setHint(); $('#t').style.display = m === 'touch' ? 'block' : 'none'; };
+  setHint();
+  const toggleView = () => { view = (view + 1) % 3; pitch = VIEWS[view].pitch; setHint(); };
   let jumpQ = false;
   addEventListener('keydown', (e) => { setMode('kb'); keys.add(e.code); if (e.code === 'KeyV' && !e.repeat) toggleView(); if (e.code === 'Space') { jumpQ = true; e.preventDefault(); } });
   addEventListener('keyup', (e) => keys.delete(e.code));
   addEventListener('blur', () => keys.clear());
-  const look = (dx, dy) => { yaw -= dx; pitch = Math.min(1.45, Math.max(0.3, pitch + dy)); };
+  const look = (dx, dy) => { yaw -= dx; pitch = Math.min(VIEWS[view].hi, Math.max(VIEWS[view].lo, pitch + dy)); };
   cv.addEventListener('mousedown', () => { setMode('kb'); if (document.pointerLockElement !== cv) cv.requestPointerLock?.(); });
   addEventListener('mousemove', (e) => { if (document.pointerLockElement === cv || e.buttons) look(e.movementX * 0.004, e.movementY * 0.003); });
   addEventListener('wheel', (e) => { zoom = Math.min(2.6, Math.max(0.45, zoom * Math.exp(e.deltaY * 0.001))); e.preventDefault(); }, { passive: false });
@@ -152,10 +157,13 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     const V = VIEWS[view], dist = V.dist * zoom;
     const cp = Math.cos(pitch), sp = Math.sin(pitch), fx = Math.cos(yaw), fy = Math.sin(yaw);
     const F = [fx * cp, fy * cp, -sp], R = [fy, -fx, 0], Up = [R[1] * F[2] - R[2] * F[1], R[2] * F[0] - R[0] * F[2], R[0] * F[1] - R[1] * F[0]];
-    const tx = s[0], ty = s[1], tz = cz + 0.9;
-    const tanV = V.tan * Math.max(1, (ih / iw) * 0.8);
+    // first person: camera at eye height (dist 0), avatar hidden
+    const tx = s[0], ty = s[1], tz = cz + (V.fps ? 1.55 : 0.9);
+    const tanV = V.tan * Math.max(1, (ih / iw) * (V.fps ? 0.6 : 0.8));
+    const far = V.fps ? 64 : V.fog ? dist * 3.2 : dist * 6;
     U.set([iw, ih, now / 1000 + t0, tanV, tx - F[0] * dist, ty - F[1] * dist, tz - F[2] * dist, V.fog,
-      ...F, V.fog ? dist * 3.2 : dist * 6, ...R, iw / ih, ...Up, 0, s[0], s[1], s[2], 0, s[4], s[5], s[6], s[7]]);
+      ...F, far, ...R, iw / ih, ...Up, 0, s[0], s[1], s[2], 0, s[4], s[5], s[6], s[7], V.fps ? 1 : 0, 0, 0, 0]);
+    if ((V.fps | 0) !== cross) { cross = V.fps | 0; dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, 0, 0])); }
     dev.queue.writeBuffer(ub, 0, U);
     const enc = dev.createCommandEncoder();
     let p = enc.beginRenderPass({ colorAttachments: [{ view: rt.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] });
