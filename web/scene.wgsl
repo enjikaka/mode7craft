@@ -54,13 +54,6 @@ fn player(t: vec3i) -> u32 {
   }
   return 0u;
 }
-fn solidT(t: vec3i) -> u32 {
-  let pm = player(t); if (pm != 0u) { return pm; }
-  let id = block(t >> vec3u(3u));
-  if (id == 5u) { let l = t & vec3i(7); if (l.x < 2 || l.x > 5 || l.y < 2 || l.y > 5) { return 0u; } }
-  if (id == 6u && h3(t) < 0.06) { return 0u; }
-  return id;
-}
 fn vn(p: vec2f) -> f32 {
   let i = vec2i(floor(p)); let f = fract(p); let u = f * f * (3. - 2. * f);
   return mix(mix(h2(i), h2(i + vec2i(1, 0)), u.x), mix(h2(i + vec2i(0, 1)), h2(i + vec2i(1, 1)), u.x), u.y);
@@ -80,17 +73,72 @@ fn cloud(p: vec2f) -> f32 {
   }
   return hmax;
 }
-// 1 = lit, <1 shadowed (terrain/sprite shadow + cloud shadow)
-fn shadow(q0: vec3f) -> f32 {
-  var q = q0; var s = 1.;
-  for (var j = 0; j < 30; j++) {
-    q += SUN * (1.6 / S);
-    if (q.z > 15.) { break; }
-    if (solidT(vec3i(floor(q * S))) != 0u) { s = 0.; break; }
+struct Hit { t: f32, id: u32, n: vec3f };
+fn sinv(d: vec3f) -> vec3f { return 1. / select(d, vec3f(1e-9), abs(d) < vec3f(1e-9)); }
+// exact ray/AABB slab test: (t enter, t exit) + entry normal
+fn slab(ro: vec3f, inv: vec3f, rd: vec3f, b0: vec3f, b1: vec3f, n: ptr<function, vec3f>) -> vec2f {
+  let a = (b0 - ro) * inv; let b = (b1 - ro) * inv; let lo = min(a, b); let hi = max(a, b);
+  let tn = max(max(lo.x, lo.y), lo.z);
+  if (tn == lo.x) { *n = vec3f(-sign(rd.x), 0., 0.); } else if (tn == lo.y) { *n = vec3f(0., -sign(rd.y), 0.); } else { *n = vec3f(0., 0., -sign(rd.z)); }
+  return vec2f(tn, min(min(hi.x, hi.y), hi.z));
+}
+// Exact voxel traversal (Amanatides-Woo DDA) over the block grid. Replaces fixed
+// slice stepping, which skipped texels at grazing angles and mis-guessed faces.
+fn traceBlocks(ro: vec3f, rd: vec3f, tA: f32, tB: f32, steps: i32) -> Hit {
+  var h: Hit; h.t = tB; h.id = 0u; h.n = vec3f(0., 0., 1.);
+  let inv = sinv(rd); var n = vec3f(0., 0., 1.);
+  let w = slab(ro, inv, rd, vec3f(0.), vec3f(f32(N), f32(N), f32(NZ)), &n);
+  var t = max(tA, w.x); let te = min(tB, w.y);
+  if (t >= te) { return h; }
+  if (w.x < tA) { n = -sign(rd) * vec3f(0., 0., 1.); }
+  let st = select(vec3i(-1), vec3i(1), rd > vec3f(0.));
+  var c = clamp(vec3i(floor(ro + rd * (t + 1e-4))), vec3i(0), vec3i(N - 1, N - 1, NZ - 1));
+  let dl = abs(inv);
+  var tm = (vec3f(c) + select(vec3f(0.), vec3f(1.), rd > vec3f(0.)) - ro) * inv;
+  for (var i = 0; i < steps; i++) {
+    let id = block(c);
+    if (id == 5u) {
+      // trunk: thin box inside the cell (exact)
+      var bn = n;
+      let r = slab(ro, inv, rd, vec3f(c) + vec3f(.25, .25, 0.), vec3f(c) + vec3f(.75, .75, 1.), &bn);
+      if (r.x <= r.y && r.y >= t) { h.t = max(r.x, t); h.id = 5u; h.n = select(n, bn, r.x >= t); return h; }
+    } else if (id != 0u) { h.t = t; h.id = id; h.n = n; return h; }
+    if (tm.x < tm.y && tm.x < tm.z) { t = tm.x; tm.x += dl.x; c.x += st.x; n = vec3f(f32(-st.x), 0., 0.); }
+    else if (tm.y < tm.z) { t = tm.y; tm.y += dl.y; c.y += st.y; n = vec3f(0., f32(-st.y), 0.); }
+    else { t = tm.z; tm.z += dl.z; c.z += st.z; n = vec3f(0., 0., f32(-st.z)); }
+    if (t > te || any(c < vec3i(0)) || c.x >= N || c.y >= N || c.z >= NZ) { break; }
   }
-  let qc = q0.xy + SUN.xy * ((CB + 0.6 - q0.z) / SUN.z);
-  if (cloud((floor(qc * S) + .5) / S) > 0.) { s = min(s, 0.); }
-  return s;
+  return h;
+}
+// Exact texel DDA through the sprite-stacked avatar's bounding box (texel space).
+fn tracePlayer(ro: vec3f, rd: vec3f, tB: f32) -> Hit {
+  var h: Hit; h.t = tB; h.id = 0u; h.n = vec3f(0., 0., 1.);
+  let P = U[5]; let z0 = floor(P.z * S + 0.01);
+  let o = ro * S; let inv = sinv(rd); var n = vec3f(0., 0., 1.);
+  let r = slab(o, inv, rd, vec3f(P.xy * S - 5., z0), vec3f(P.xy * S + 5., z0 + 15.), &n);
+  if (r.x > r.y || r.y < 0. || r.x > tB * S) { return h; }
+  var t = max(r.x, 0.);
+  let st = select(vec3i(-1), vec3i(1), rd > vec3f(0.));
+  var c = vec3i(floor(o + rd * (t + 1e-3)));
+  let dl = abs(inv);
+  var tm = (vec3f(c) + select(vec3f(0.), vec3f(1.), rd > vec3f(0.)) - o) * inv;
+  for (var i = 0; i < 40; i++) {
+    let id = player(c);
+    if (id != 0u) { if (t / S < tB) { h.t = t / S; h.id = id; h.n = n; } return h; }
+    if (tm.x < tm.y && tm.x < tm.z) { t = tm.x; tm.x += dl.x; c.x += st.x; n = vec3f(f32(-st.x), 0., 0.); }
+    else if (tm.y < tm.z) { t = tm.y; tm.y += dl.y; c.y += st.y; n = vec3f(0., f32(-st.y), 0.); }
+    else { t = tm.z; tm.z += dl.z; c.z += st.z; n = vec3f(0., 0., f32(-st.z)); }
+    if (t > r.y) { break; }
+  }
+  return h;
+}
+// 1 = lit, 0 = shadowed (blocks, avatar, clouds)
+fn shadow(p: vec3f) -> f32 {
+  if (traceBlocks(p, SUN, 0.0, 16., 28).id != 0u) { return 0.; }
+  if (tracePlayer(p, SUN, 16.).id != 0u) { return 0.; }
+  let qc = p.xy + SUN.xy * ((CB + 0.6 - p.z) / SUN.z);
+  if (cloud((floor(qc * S) + .5) / S) > 0.) { return 0.; }
+  return 1.;
 }
 // layered greens: each height level gets its own band colour (light low, darker raised)
 fn grassCol(hb: f32) -> vec3f {
@@ -151,72 +199,77 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let res = U[0].xy; let uv = fc.xy / res * 2. - 1.;
   let nd = vec2f(uv.x * U[3].w, -uv.y) * U[0].w;
-  let o = U[1].xyz; let d = normalize(U[2].xyz + U[3].xyz * nd.x + U[4].xyz * nd.y);
+  let o = U[1].xyz; let F = U[2].xyz; let R = U[3].xyz; let Up = U[4].xyz;
+  let d = normalize(F + R * nd.x + Up * nd.y);
   let far = U[2].w; let fogOn = U[1].w;
   if (d.z > -0.002) { return vec4f(sky(d), 1.); }
-  // clouds: stacked blob slices above the terrain
+  // ---- clouds: stacked blob slices above the terrain ----
+  var cc = vec3f(1.); var ca = 0.; var ct = 0.;
   for (var k = 0; k < 10; k++) {
     let j = 9 - k; let z = CB + f32(j + 1) / S; let t = (z - o.z) / d.z;
     if (t < 0.) { continue; } if (t > far) { break; }
     let q = (floor((o.xy + d.xy * t) * S) + .5) / S;
-    // SNES-style checkerboard dither so clouds never fully hide the avatar
-    let qi = vec2i(floor(fc.xy));
-    if (length(q - U[5].xy) < 5. && ((qi.x + qi.y) & 1) == 0) { continue; }
     let th = cloud(q);
     if (th > f32(j)) {
-      // puffy: white tops, cool blue-grey rim on the lower, shadowed side
-      var c = vec3f(1.);
-      if (th >= f32(j + 1) && j < 9) { c = select(select(vec3f(0.97, 0.98, 1.), vec3f(0.86, 0.9, 0.96), j < 4), vec3f(0.73, 0.8, 0.91), j < 2); }
-      else if (h2(vec2i(floor(q * S))) > 0.9) { c = vec3f(0.94, 0.96, 1.); }
-      return vec4f(mix(c, FOG, fogOn * smoothstep(far * 0.4, far, t)), 1.);
-    }
-  }
-  var hit = 0u; var ht = vec3i(0); var hp = vec3f(0.); var face = 0; var prev = vec3i(-9999); var tt = 0.;
-  for (var k = NZ * 8 - 1; k >= 22; k--) {
-    let t = (f32(k + 1) / S - o.z) / d.z;
-    if (t < 0.) { continue; } if (t > far) { break; }
-    let p = o + d * t;
-    if (p.x < -1. || p.y < -1. || p.x > f32(N) + 1. || p.y > f32(N) + 1.) { prev = vec3i(-9999); continue; }
-    let tx = vec3i(vec2i(floor(p.xy * S)), k);
-    let m = solidT(tx);
-    if (m != 0u) {
-      hit = m; ht = tx; hp = p; tt = t;
-      if (solidT(tx + vec3i(0, 0, 1)) == 0u) { face = 0; }
-      else if (prev.x != tx.x && (prev.y == tx.y || abs(d.x) > abs(d.y))) { face = 1; } else { face = 2; }
+      // puffy: white tops, cool blue-grey rim on the lower side
+      if (th >= f32(j + 1) && j < 9) { cc = select(select(vec3f(0.97, 0.98, 1.), vec3f(0.86, 0.9, 0.96), j < 4), vec3f(0.73, 0.8, 0.91), j < 2); }
+      else if (h2(vec2i(floor(q * S))) > 0.9) { cc = vec3f(0.94, 0.96, 1.); }
+      // See-through, consistent in every view: fade clouds that cover the avatar's
+      // projected screen neighbourhood, clouds right above it, and clouds near the camera.
+      let pc = U[5].xyz + vec3f(0., 0., 0.9); let v = pc - o; let pd = length(v);
+      let dep = max(dot(v, F), 0.1);
+      let pnd = vec2f(dot(v, R), dot(v, Up)) / dep;
+      let rr = 1.2 / dep;                                   // avatar radius in view-plane units
+      var a = smoothstep(rr * 1.6, rr * 4.5, length(nd - pnd));
+      a = select(a, 1., t > pd);                            // behind the avatar: never occludes
+      a = min(a, smoothstep(3., 7., length(q - pc.xy)));    // avatar standing under it
+      a *= smoothstep(0.12, 0.4, t / pd);                   // big near-camera clouds
+      ca = a; ct = t;
       break;
     }
-    prev = tx;
   }
-  var col: vec3f;
-  if (hit == 0u) {
-    let t = (ZW - o.z) / d.z;
-    if (t > far) { return vec4f(sky(d), 1.); }
-    tt = t;
-    let p = o + d * t;
-    col = water(p.xy, shadow(vec3f((floor(p.xy * S) + .5) / S, ZW)));
+  if (ca > 0.995) { return vec4f(mix(cc, FOG, fogOn * smoothstep(far * 0.4, far, ct)), 1.); }
+  // ---- terrain: exact DDA through the block grid, then the avatar ----
+  let tw = (ZW - o.z) / d.z;
+  var hb = traceBlocks(o, d, 0., min(far, tw), 320);
+  let hp = tracePlayer(o, d, hb.t);
+  if (hp.id != 0u) { hb = hp; }
+  var col: vec3f; var tt = hb.t;
+  if (hb.id == 0u) {
+    if (tw > far) { col = sky(d); }
+    else {
+      tt = tw;
+      let p = o + d * tw;
+      col = water(p.xy, shadow(vec3f((floor(p.xy * S) + .5) / S, ZW)));
+    }
   } else {
-    col = matCol(hit, ht, face);
-    var q = (vec3f(ht) + vec3f(.5, .5, 1.02)) / S;
+    let p = o + d * hb.t; let n = hb.n;
+    let ht = vec3i(floor((p - n * 0.002) * S));          // texel inside the hit voxel, robust on faces
+    let face = select(select(2, 1, abs(n.x) > 0.5), 0, n.z > 0.5);
+    col = matCol(hb.id, ht, face);
     var lit = 1.;
     if (face == 0) {
-      // stepped-edge contour: darken top texels next to a drop, light rim towards the sun
       let l = ht & vec3i(7); let b = ht >> vec3u(3u);
-      if (hit < 5u) {
-        // contour: dark line at the foot of a higher step
+      if (hb.id < 5u) {
+        // contour: dark line at the foot of a higher step; rim light towards the sun
         if ((l.x == 0 && block(b + vec3i(-1, 0, 1)) != 0u) || (l.x == 7 && block(b + vec3i(1, 0, 1)) != 0u) ||
             (l.y == 0 && block(b + vec3i(0, -1, 1)) != 0u) || (l.y == 7 && block(b + vec3i(0, 1, 1)) != 0u)) { col *= 0.72; }
         if ((l.x == 7 && block(b + vec3i(1, 0, 0)) == 0u) || (l.y == 0 && block(b + vec3i(0, -1, 0)) == 0u)) { lit = 0.86; }
         if ((l.x == 0 && block(b - vec3i(1, 0, 0)) == 0u) || (l.y == 7 && block(b + vec3i(0, 1, 0)) == 0u)) { lit = 1.12; }
       }
+    } else if (n.z < -0.5) { lit = 0.5; }
+    else { lit = select(0., 0.9, dot(n.xy, SUN.xy) > 0.); }
+    if (lit == 0.) {
+      // face turned away from the sun: already in form shadow, use the shadow tint once
+      col *= vec3f(0.64, 0.7, 0.84);
     } else {
-      let nrm = select(vec2f(0., -sign(d.y)), vec2f(-sign(d.x), 0.), face == 1);
-      q = (vec3f(ht) + .5) / S + vec3f(nrm * 0.7 / S, 0.);
-      lit = select(0.66, 0.9, dot(nrm, SUN.xy) > 0.);
+      // shadow probe from the texel centre on the face (stable, pixel-art crisp)
+      let q = (vec3f(ht) + .5) / S + n * (0.5 / S + 0.01);
+      col *= lit;
+      if (shadow(q) < 0.5) { col *= vec3f(0.58, 0.64, 0.8); }
     }
-    let sh = shadow(q);
-    col *= lit;
-    if (sh < 0.5) { col *= vec3f(0.58, 0.64, 0.8); }
   }
   col = mix(col, FOG, fogOn * smoothstep(far * 0.35, far, tt));
+  if (ca > 0.) { col = mix(col, mix(cc, FOG, fogOn * smoothstep(far * 0.4, far, ct)), ca); }
   return vec4f(col, 1.);
 }

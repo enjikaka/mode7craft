@@ -115,6 +115,10 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   // ---------- frame ----------
   const U = new Float32Array(32), st = new Float32Array(mem(), X.state_ptr(), 16);
   let last = performance.now(), acc = 0, frames = 0, slow = 0;
+  // debug: ?p=x,y teleport, ?t=seconds time offset, ?pt=pitch
+  if (qs.get('p')) { const [x, y] = qs.get('p').split(',').map(Number); const hm8 = new Uint8Array(mem(), X.height_ptr(), N * N); st[0] = x + 0.5; st[1] = y + 0.5; st[2] = hm8[y * N + x] + 2; }
+  if (qs.get('pt')) pitch = +qs.get('pt');
+  const t0 = +qs.get('t') || 0;
   cz = st[2];
   const frame = (now) => {
     const dt = Math.min(0.05, (now - last) / 1000); last = now;
@@ -150,7 +154,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     const F = [fx * cp, fy * cp, -sp], R = [fy, -fx, 0], Up = [R[1] * F[2] - R[2] * F[1], R[2] * F[0] - R[0] * F[2], R[0] * F[1] - R[1] * F[0]];
     const tx = s[0], ty = s[1], tz = cz + 0.9;
     const tanV = V.tan * Math.max(1, (ih / iw) * 0.8);
-    U.set([iw, ih, now / 1000, tanV, tx - F[0] * dist, ty - F[1] * dist, tz - F[2] * dist, V.fog,
+    U.set([iw, ih, now / 1000 + t0, tanV, tx - F[0] * dist, ty - F[1] * dist, tz - F[2] * dist, V.fog,
       ...F, V.fog ? dist * 3.2 : dist * 6, ...R, iw / ih, ...Up, 0, s[0], s[1], s[2], 0, s[4], s[5], s[6], s[7]]);
     dev.queue.writeBuffer(ub, 0, U);
     const enc = dev.createCommandEncoder();
