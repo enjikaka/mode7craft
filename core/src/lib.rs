@@ -14,7 +14,7 @@ extern "C" {
     #[link_name = "msqrt"] fn msqrt(x: f32) -> f32;
 }
 
-pub const N: usize = 128;
+pub const N: usize = 256;
 pub const NZ: usize = 16;
 const WL: i32 = 3; // water surface level (blocks below are sea)
 
@@ -136,11 +136,13 @@ pub extern "C" fn pick(ox: f32, oy: f32, oz: f32, dx: f32, dy: f32, dz: f32, max
 }
 
 #[no_mangle]
-pub extern "C" fn gen(seed: u32) {
-    unsafe { SEED = seed | 1; W.fill(0); }
-    let c = N as f32 * 0.5;
-    for y in 0..N as i32 {
-        for x in 0..N as i32 {
+pub extern "C" fn gen(seed: u32, n: u32) {
+    // n = island size (256; 128 rebuilds the pre-v11 island in the corner, used to migrate old saves)
+    let n = if n == 0 || n as usize > N { N as i32 } else { n as i32 };
+    unsafe { SEED = seed | 1; W.fill(0); H.fill(0); }
+    let c = n as f32 * 0.5;
+    for y in 0..n {
+        for x in 0..n {
             let dx = (x as f32 - c) / c; let dy = (y as f32 - c) / c;
             // warp the radius a bit so the coast is wobbly
             let r = sqrt(dx * dx + dy * dy) + (vnoise(x as f32 * 0.05, y as f32 * 0.05) - 0.5) * 0.35;
@@ -160,8 +162,8 @@ pub extern "C" fn gen(seed: u32) {
     for i in 0..N * N { unsafe { SEA[i] = (H[i] < WL as u8 - 1) as u8; } }
     // a few birch trees
     let mut trees = 0;
-    for y in 4..N as i32 - 4 {
-        for x in 4..N as i32 - 4 {
+    for y in 4..n - 4 {
+        for x in 4..n - 4 {
             let h = hgt(x, y);
             if h < WL + 1 || h > 8 || get(x, y, h - 1) != GRASS { continue; }
             // trees prefer some patches, sparse elsewhere
@@ -190,8 +192,8 @@ pub extern "C" fn gen(seed: u32) {
         }
     }
     // spawn: highest-ish clear grass spot near centre
-    let mut best = (64, 64); let mut bd = 1e9;
-    for y in 0..N as i32 { for x in 0..N as i32 {
+    let mut best = (n / 2, n / 2); let mut bd = 1e9;
+    for y in 0..n { for x in 0..n {
         let h = hgt(x, y);
         if h < WL + 2 || get(x, y, h) != 0 || get(x, y, h + 1) != 0 { continue; }
         let d = (x as f32 - c) * (x as f32 - c) + (y as f32 - c - 10.0) * (y as f32 - c - 10.0);

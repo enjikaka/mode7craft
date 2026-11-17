@@ -23,31 +23,71 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   // fragment stage (sun-shadow cache), leaf splats in the vertex stage. Undefined (e.g. Safari) = core = fine.
   const noFS = dev.limits.maxStorageBuffersInFragmentStage === 0, noVS = dev.limits.maxStorageBuffersInVertexStage === 0;
   const { instance } = await wasmP; const X = instance.exports;
-  X.gen(1337);
-  const mem = () => X.memory.buffer;
-  const N = 128, NZ = 16;
+  const mem = () => X.memory.buffer; let migrated = 0;
+  const N = 256, NZ = 16, ON = 128;   // v11: 256x256 island (ON = pre-v11 size)
   const qs = new URLSearchParams(location.search);
+  // ?legacy: the pre-v11 128 island in the world corner (same coordinates as v10, for diffing)
+  const genW = () => X.gen(1337, qs.has('legacy') ? ON : N);
+  genW();
   // ---------- saved edits (localStorage diff: base36 index + block id) ----------
-  const KEY = 'm7c-edits-1', edits = new Map();
-  if (qs.has('reset')) localStorage.removeItem(KEY);
-  for (const e of (localStorage.getItem(KEY) || '').split(',')) {
-    if (!e) continue; const i = parseInt(e.slice(0, -1), 36), id = +e.slice(-1);
-    edits.set(i, id); X.set_block(i % N, (i / N | 0) % N, i / (N * N) | 0, id);
-  }
+  const KEY = 'm7c-edits-2', KEY1 = 'm7c-edits-1', edits = new Map();
+  if (qs.has('reset')) { localStorage.removeItem(KEY); localStorage.removeItem(KEY1); }
+  const parseEd = (str) => { const m = new Map(); for (const e of (str || '').split(',')) if (e) m.set(parseInt(e.slice(0, -1), 36), +e.slice(-1)); return m; };
+  // old 128x128 saves: rebuild the old island + edits, cut out the edited area (+4 blocks of terrain
+  // around it) and paste it into the centre of the new island; returns the edits for the new world
+  const migrate = (old) => {
+    const out = new Map(); if (!old.size) return out;
+    X.gen(1337, ON); let x0 = ON, y0 = ON, x1 = -1, y1 = -1;
+    for (const [i, id] of old) { const x = i % ON, y = (i / ON | 0) % ON; X.set_block(x, y, i / (ON * ON) | 0, id); x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+    x0 = Math.max(0, x0 - 4); y0 = Math.max(0, y0 - 4); x1 = Math.min(ON - 1, x1 + 4); y1 = Math.min(ON - 1, y1 + 4);
+    const w = new Uint8Array(mem(), X.world_ptr(), N * N * NZ), patch = [];
+    for (let z = 0; z < NZ; z++) for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) patch.push([x + (N - ON) / 2, y + (N - ON) / 2, z, w[(z * N + y) * N + x]]);
+    X.gen(1337, N); const w2 = new Uint8Array(mem(), X.world_ptr(), N * N * NZ);
+    for (const [x, y, z, id] of patch) { const i = (z * N + y) * N + x; if (w2[i] !== id) out.set(i, id); }
+    return out;
+  };
+  let saved = parseEd(localStorage.getItem(KEY));
+  if (!qs.has('legacy') && !localStorage.getItem(KEY) && localStorage.getItem(KEY1)) { saved = migrate(parseEd(localStorage.getItem(KEY1))); genW(); migrated = saved.size; }
+  if (qs.has('legacy')) saved.clear();
+  for (const [i, id] of saved) { edits.set(i, id); X.set_block(i % N, (i / N | 0) % N, i / (N * N) | 0, id); }
   let saveT = 0;
   const save = () => { clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem(KEY, [...edits].map(([i, id]) => i.toString(36) + id).join(',')); } catch {} }, 400); };
+  if (migrated) save();   // the migrated edits go to the new key right away (the old key stays as a backup)
 
+  // exact GPU memory bookkeeping (m7.gpuMem()): every texture/buffer we create, minus destroyed ones
+  const gmem = new Map(), BPP = { r8uint: 1, r16uint: 2, rgba8unorm: 4, bgra8unorm: 4, rgba16float: 8, depth32float: 4 };
+  for (const [f, sz] of [['createTexture', (d) => d.size[0] * (d.size[1] || 1) * (d.size[2] || 1) * BPP[d.format]], ['createBuffer', (d) => d.size]]) {
+    const o = dev[f].bind(dev); dev[f] = (d) => { const r = o(d), od = r.destroy.bind(r); gmem.set(r, [d.label || d.format || 'buffer', sz(d)]); r.destroy = () => { gmem.delete(r); od(); }; return r; };
+  }
   const ctx = cv.getContext('webgpu'), fmt = navigator.gpu.getPreferredCanvasFormat();
   ctx.configure({ device: dev, format: fmt, alphaMode: 'opaque' });
   const T = GPUTextureUsage;
-  const vox = dev.createTexture({ size: [N, N, NZ], dimension: '3d', format: 'r8uint', usage: T.TEXTURE_BINDING | T.COPY_DST });
-  const hm = dev.createTexture({ size: [N, N], format: 'r8uint', usage: T.TEXTURE_BINDING | T.COPY_DST });
-  dev.queue.writeTexture({ texture: vox }, new Uint8Array(mem(), X.world_ptr(), N * N * NZ), { bytesPerRow: N, rowsPerImage: N }, [N, N, NZ]);
-  dev.queue.writeTexture({ texture: hm }, new Uint8Array(mem(), X.height_ptr(), N * N), { bytesPerRow: N }, [N, N]);
-  // partial upload: only the touched voxel + its heightmap texel
+  // GPU world data (v11, packed): vox = 4 bits per voxel (2 per r8 texel along x), hm = r16 per column
+  // (terrain height | top-of-anything height << 5 | top block id << 10, for water and the far heightmap
+  // march), occ = 1 byte per 4x4x4 brick (any visible block) for empty-space skipping in the DDA
+  const vox = dev.createTexture({ label: 'vox', size: [N / 2, N, NZ], dimension: '3d', format: 'r8uint', usage: T.TEXTURE_BINDING | T.COPY_DST });
+  const hm = dev.createTexture({ label: 'hm', size: [N, N], format: 'r16uint', usage: T.TEXTURE_BINDING | T.COPY_DST });
+  const occT = dev.createTexture({ label: 'occ', size: [N / 4, N / 4, NZ / 4], dimension: '3d', format: 'r8uint', usage: T.TEXTURE_BINDING | T.COPY_DST });
+  const W8 = () => new Uint8Array(mem(), X.world_ptr(), N * N * NZ), H8 = () => new Uint8Array(mem(), X.height_ptr(), N * N);
+  const hmCol = (w, h, x, y) => { let z = NZ - 1; for (; z >= 0; z--) { const b = w[(z * N + y) * N + x]; if (b && b !== 8) break; } return h[y * N + x] | (z + 1) << 5 | (z >= 0 ? w[(z * N + y) * N + x] : 0) << 10; };
+  const NOOCC = qs.get('occ') === '0';   // debug: ?occ=0 marks every brick occupied (no empty-space skipping)
+  const brick = (w, bx, by, bz) => { if (NOOCC) return 1; for (let z = bz * 4; z < bz * 4 + 4; z++) for (let y = by * 4; y < by * 4 + 4; y++) for (let x = bx * 4; x < bx * 4 + 4; x++) { const b = w[(z * N + y) * N + x]; if (b && b !== 8) return 1; } return 0; };
+  const uploadWorld = () => {
+    const w = W8(), h = H8(), v = new Uint8Array(N * N * NZ / 2), m = new Uint16Array(N * N), o = new Uint8Array(N * N * NZ / 64);
+    for (let i = 0; i < v.length; i++) v[i] = w[2 * i] | w[2 * i + 1] << 4;
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) m[y * N + x] = hmCol(w, h, x, y);
+    for (let z = 0; z < NZ / 4; z++) for (let y = 0; y < N / 4; y++) for (let x = 0; x < N / 4; x++) o[(z * N / 4 + y) * N / 4 + x] = brick(w, x, y, z);
+    dev.queue.writeTexture({ texture: vox }, v, { bytesPerRow: N / 2, rowsPerImage: N }, [N / 2, N, NZ]);
+    dev.queue.writeTexture({ texture: hm }, m, { bytesPerRow: N * 2 }, [N, N]);
+    dev.queue.writeTexture({ texture: occT }, o, { bytesPerRow: N / 4, rowsPerImage: N / 4 }, [N / 4, N / 4, NZ / 4]);
+  };
+  uploadWorld();
+  // partial upload: only the touched voxel pair, its column and its brick
   const touch1 = (x, y, z, id) => {
-    dev.queue.writeTexture({ texture: vox, origin: [x, y, z] }, new Uint8Array([id]), {}, [1, 1, 1]);
-    dev.queue.writeTexture({ texture: hm, origin: [x, y] }, new Uint8Array(mem(), X.height_ptr() + y * N + x, 1), {}, [1, 1]);
+    const w = W8(), i = (z * N + y) * N + (x & ~1);
+    dev.queue.writeTexture({ texture: vox, origin: [x >> 1, y, z] }, new Uint8Array([w[i] | w[i + 1] << 4]), {}, [1, 1, 1]);
+    dev.queue.writeTexture({ texture: hm, origin: [x, y] }, new Uint16Array([hmCol(w, H8(), x, y)]), {}, [1, 1]);
+    dev.queue.writeTexture({ texture: occT, origin: [x >> 2, y >> 2, z >> 2] }, new Uint8Array([brick(w, x >> 2, y >> 2, z >> 2)]), {}, [1, 1, 1]);
     edits.set((z * N + y) * N + x, id); save(); lightsT = 0; bakeDirty = leafDirty = true;
   };
   // ---------- world files: 'M7C' + version 1 + flags (1 = deflate-raw) + 3 bytes per edit:
@@ -58,28 +98,30 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     const e = [...edits].sort((a, b) => a[0] - b[0]); let r = new Uint8Array(e.length * 3), prev = 0;
     e.forEach(([i, id], k) => { const v = (i - prev) << 4 | id; prev = i; r.set([v >> 16, v >> 8 & 255, v & 255], k * 3); });
     const z = typeof CompressionStream == 'function'; if (z) r = await zip(r);
-    const o = new Uint8Array(r.length + 5); o.set([77, 55, 67, 1, +z]); o.set(r, 5); return o;
+    const o = new Uint8Array(r.length + 5); o.set([77, 55, 67, 2, +z]); o.set(r, 5); return o;
   };
   const unpack = async (b) => {
-    if (b.length < 5 || b[0] != 77 || b[1] != 55 || b[2] != 67 || b[3] != 1 || b[4] > 1) throw 0;
+    if (b.length < 5 || b[0] != 77 || b[1] != 55 || b[2] != 67 || b[3] < 1 || b[3] > 2 || b[4] > 1) throw 0;
+    const v1 = b[3] === 1, mx = v1 ? ON * ON * NZ : MAXI;   // v1 = 128x128 world: migrated into the new island
     let r = b.subarray(5); if (b[4]) r = await zip(r, 1);
     if (r.length % 3) throw 0;
     const m = new Map(); let i = 0;
-    for (let k = 0; k < r.length; k += 3) { const v = r[k] << 16 | r[k + 1] << 8 | r[k + 2], id = v & 15; i += v >> 4; if (i >= MAXI || id > 8) throw 0; m.set(i, id); }
+    for (let k = 0; k < r.length; k += 3) { const v = r[k] << 16 | r[k + 1] << 8 | r[k + 2], id = v & 15; i += v >> 4; if (i >= mx || id > 8) throw 0; m.set(i, id); }
+    if (v1) { const r2 = migrate(m); genW(); for (const [i, id] of edits) X.set_block(i % N, (i / N | 0) % N, i / (N * N) | 0, id); return r2; }
     return m;
   };
   const b64 = (b) => { let s = ''; for (const c of b) s += String.fromCharCode(c); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
   const unb64 = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
   // replace the world: fresh island + imported edits, full re-upload
   const loadWorld = (m) => {
-    X.gen(1337); edits.clear(); parts.length = 0;
+    genW(); edits.clear(); parts.length = 0;
     for (const [i, id] of m) { edits.set(i, id); X.set_block(i % N, (i / N | 0) % N, i / (N * N) | 0, id); }
-    dev.queue.writeTexture({ texture: vox }, new Uint8Array(mem(), X.world_ptr(), N * N * NZ), { bytesPerRow: N, rowsPerImage: N }, [N, N, NZ]);
-    dev.queue.writeTexture({ texture: hm }, new Uint8Array(mem(), X.height_ptr(), N * N), { bytesPerRow: N }, [N, N]);
+    uploadWorld();
     save(); lightsT = 0; cz = st[2]; bakeDirty = leafDirty = true;
   };
   const ask = (m) => !edits.size || confirm(`Ers\u00e4tt din v\u00e4rld med den importerade (${m.size} \u00e4ndringar)?`);
   const toast = (m) => { hint.textContent = m; clearTimeout(toast.t); toast.t = setTimeout(setHint, 3500); };
+  if (migrated) setTimeout(() => toast('Gammal v\u00e4rld flyttad till mitten av nya \u00f6n'), 600);
   const importBytes = async (b) => { let m; try { m = await unpack(b); } catch { toast('Ogiltig v\u00e4rldsfil'); return 0; } if (!ask(m)) return 0; loadWorld(m); toast(`V\u00e4rld laddad: ${m.size} \u00e4ndringar`); return m.size; };
   const exportWorld = async () => {
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([await pack()], { type: 'application/octet-stream' }));
@@ -96,15 +138,26 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   fileIn.addEventListener('change', async () => { const f = fileIn.files[0]; fileIn.value = ''; if (f) importBytes(new Uint8Array(await f.arrayBuffer())); });
   // torches: nearest 32 to the player go to the uniform as point lights
   let lights = [], lightsT = 0;
-  const ub = dev.createBuffer({ size: 320, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  const tb = dev.createBuffer({ size: 512, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  const bb = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  // HQ sun-shadow cache (1 byte per block cell, 128 = unknown -> per-pixel rays until the first bake)
-  const scb = dev.createBuffer({ size: N * N * NZ, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-  const scb2 = dev.createBuffer({ size: N * N * NZ, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });   // copy for the splat pass
-  dev.queue.writeBuffer(scb, 0, new Uint8Array(N * N * NZ).fill(128));
-  // exposed leaf voxels for the HQ leaf splats: index | open-face mask << 18 (sides + top; rebuilt after world edits)
-  const MAXL = 6000, lfb = dev.createBuffer({ size: MAXL * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const ub = dev.createBuffer({ label: 'uniforms', size: 352, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const tb = dev.createBuffer({ label: 'uniforms', size: 512, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const bb = dev.createBuffer({ label: 'uniforms', size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  // render distance 'Sikt': far-plane scale, and the HQ sun-shadow cache window (WS x WS columns around the view)
+  const FOGS = +qs.get('fogs') || 0.55;
+  const SIKT = [{ m: 0.6, ws: 128 }, { m: 1, ws: N }, { m: 2.5, ws: N }];
+  const vq = (qs.get('view') || '').toLowerCase();
+  let sikt = +({ kort: 0, short: 0, normal: 1, lang: 2, 'l\u00e5ng': 2, long: 2 }[vq] ?? (vq || localStorage.getItem('m7c-view') || 1)) % 3 || 0;
+  // HQ sun-shadow cache (2 bits per cell of the window: shadow / lit / unknown -> per-pixel rays); HQ only, Standard binds a stub
+  const sc0 = dev.createBuffer({ label: 'shadowcache', size: 16, usage: GPUBufferUsage.STORAGE });
+  let scb = null, WS = 0, wx = 0, wy = 0, bakedW = '';
+  const scAlloc = () => {
+    const ws = hq ? SIKT[sikt].ws : 0; if (ws === WS) return; scb?.destroy(); scb = null; WS = ws; bakedW = ''; if (Q) Q.bg = Q.bgL = null;
+    if (ws) { scb = dev.createBuffer({ label: 'shadowcache', size: ws * ws * NZ / 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); dev.queue.writeBuffer(scb, 0, new Uint8Array(ws * ws * NZ / 4).fill(0xaa)); }
+  };
+  // per-splat lit colour (4 halfs), written once per frame by the 'slit' compute pass
+  const SPLATS = +qs.get('splats') || 24000;   // total splat cap
+  let spb = null;
+  // exposed leaf voxels for the HQ leaf splats: index | open-face mask << 20 (sides + top; rebuilt after world edits)
+  const MAXL = 16384, lfb = dev.createBuffer({ label: 'leaflist', size: MAXL * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   let nLeaf = 0, leafDirty = true;
   const leafList = () => {
     const w = new Uint8Array(mem(), X.world_ptr(), N * N * NZ), a = new Uint32Array(MAXL), D = [1, -1, N, -N, N * N, -N * N]; nLeaf = 0;
@@ -112,7 +165,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
       if (w[i] !== 6) continue;
       const x = i % N, y = (i / N | 0) % N, z = i / (N * N) | 0, ok = [x < N - 1, x > 0, y < N - 1, y > 0, z < NZ - 1, z > 0]; let m = 0;
       for (let k = 0; k < 5; k++) if (ok[k] && (w[i + D[k]] === 0 || w[i + D[k]] === 8)) m |= 1 << k;
-      if (m) a[nLeaf++] = i | m << 18;
+      if (m) a[nLeaf++] = i | m << 20;
     }
     dev.queue.writeBuffer(lfb, 0, a); leafDirty = false;
   };
@@ -143,7 +196,8 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   // Built and allocated only when HQ is switched on; standard mode never touches any of it.
   const fxq = qs.get('fx'); let hq = !hqOff && (fxq ?? localStorage.getItem('m7c-fx') ?? '1') === '1';
   const tq = qs.get('tod'); let tod = tq != null ? (isNaN(+tq) ? tq : +tq) : localStorage.getItem('m7c-tod') || 'cyc', Q = null, bt, lt, bgB, bgO;
-  const hqP = () => Q ||= { bake: guard('hq', () => dev.createComputePipeline({ layout: 'auto', compute: { module: mod(spec(SCENE_WGSL)), entryPoint: 'bake' } })), splat: mk(SCENE_WGSL, 'rgba16float', 'sfs', { HQ: 1 }, 'less', 'svs', 'splat'), bloom: mk(HQ_WGSL, 'rgba16float', 'fb', 0, 0, 'vs', 'hq'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo', 0, 0, 'vs', 'hq'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
+  const hqP = () => Q ||= { bake: guard('hq', () => dev.createComputePipeline({ layout: 'auto', compute: { module: mod(spec(SCENE_WGSL)), entryPoint: 'bake' } })), splat: mk(SCENE_WGSL, 'rgba16float', 'sfs', { HQ: 1 }, 'less', 'svs', 'splat'), slit: guard('splat', () => dev.createComputePipeline({ layout: 'auto', compute: { module: mod(spec(SCENE_WGSL, { HQ: 1 })), entryPoint: 'slit' } })), bloom: mk(HQ_WGSL, 'rgba16float', 'fb', 0, 0, 'vs', 'hq'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo', 0, 0, 'vs', 'hq'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
+  const bgE = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map(([binding, resource]) => ({ binding, resource })) });
   const bgr = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map((resource, binding) => ({ binding, resource })) });
   // edges: 0 Pixel (classic), 1 Mjuka (edge-smoothing upscale), 2 Skarpa (near-native rays, art-size texels)
   const eq = qs.get('edge'); let edge = +(eq ?? localStorage.getItem('m7c-edge') ?? 2) % 3 || 0, art = 0;
@@ -154,7 +208,6 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   // ordered 4x4 Bayer dithering to a limited palette in the upscale: 'auto' = HQ only, '1' on, '0' off
   const dq = qs.get('dither'); let dith = dq ?? localStorage.getItem('m7c-dither') ?? '0';
   // leaves: 0 Block (old solid), 1 Löv (porous leaf sprites), 2 Löv+splats (HQ: + swaying leaf splats); 'auto' = 2 in HQ, 1 in Standard
-  const SPLATS = +qs.get('splats') || 24000;   // total splat cap
   const lq = qs.get('leaf'); let leaf = lq ?? localStorage.getItem('m7c-leaf') ?? 'auto';
   const leafM = () => { const m = leafOff ? 0 : leaf === 'auto' ? (hq ? 2 : 1) : +leaf || 0; return (hq && !splatOff && !noVS) || m < 2 ? m : 1; };
   const splatK = () => Math.max(1, Math.min(8, Math.round(8 * AREA / (+qs.get('area') || area0())), Math.floor(SPLATS / Math.max(nLeaf, 1))));
@@ -169,14 +222,20 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     iw = Math.ceil(W / px); ih = Math.ceil(H / px);
     rt?.destroy(); dt?.destroy(); bt?.destroy(); lt?.destroy(); bt = lt = dt = null;
     const u = T.RENDER_ATTACHMENT | T.TEXTURE_BINDING;
-    rt = dev.createTexture({ size: [iw, ih], format: hq ? 'rgba16float' : 'rgba8unorm', usage: u | T.COPY_SRC });   // COPY_SRC: black-frame probe
-    if (hq) hqP(); SP = sceneP(hq, +(leafM() > 0)); sg = bgr(SP, [{ buffer: ub }, vox.createView(), hm.createView(), { buffer: tb }, { buffer: scb }]);
-    if (hq) Q.bg ||= dev.createBindGroup({ layout: Q.bake.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ub } }, { binding: 1, resource: vox.createView() }, { binding: 7, resource: { buffer: scb } }] });
+    rt = dev.createTexture({ label: 'scene', size: [iw, ih], format: hq ? 'rgba16float' : 'rgba8unorm', usage: u | T.COPY_SRC });   // COPY_SRC: black-frame probe
+    if (hq) hqP(); scAlloc(); SP = sceneP(hq, +(leafM() > 0));
+    sg = bgE(SP, [[0, { buffer: ub }], [1, vox.createView()], [2, hm.createView()], [3, { buffer: tb }], [4, { buffer: scb || sc0 }], [8, occT.createView()]]);
+    if (hq) Q.bg ||= bgE(Q.bake, [[0, { buffer: ub }], [1, vox.createView()], [7, { buffer: scb }]]);
+    spb?.destroy(); spb = null;
     if (hq) {
-      dt = dev.createTexture({ size: [iw, ih], format: 'depth32float', usage: T.RENDER_ATTACHMENT });
-      sgS = dev.createBindGroup({ layout: Q.splat.getBindGroupLayout(0), entries: [[0, { buffer: ub }], [1, vox.createView()], [3, { buffer: tb }], [4, { buffer: scb2 }], [5, { buffer: lfb }]].map(([binding, resource]) => ({ binding, resource })) });
-      bt = dev.createTexture({ size: [Math.ceil(iw / 4), Math.ceil(ih / 4)], format: 'rgba16float', usage: u });
-      lt = dev.createTexture({ size: [iw, ih], format: 'rgba8unorm', usage: u });
+      dt = dev.createTexture({ label: 'depth', size: [iw, ih], format: 'depth32float', usage: T.RENDER_ATTACHMENT });
+      if (leafM() === 2) {
+        spb = dev.createBuffer({ label: 'splatcol', size: SPLATS * 8, usage: GPUBufferUsage.STORAGE });
+        Q.bgL = bgE(Q.slit, [[0, { buffer: ub }], [1, vox.createView()], [3, { buffer: tb }], [4, { buffer: scb }], [5, { buffer: lfb }], [8, occT.createView()], [9, { buffer: spb }]]);
+        sgS = bgE(Q.splat, [[0, { buffer: ub }], [5, { buffer: lfb }], [6, { buffer: spb }]]);
+      }
+      bt = dev.createTexture({ label: 'bloom', size: [Math.ceil(iw / 4), Math.ceil(ih / 4)], format: 'rgba16float', usage: u });
+      lt = dev.createTexture({ label: 'tonemap', size: [iw, ih], format: 'rgba8unorm', usage: u });
       bgB = bgr(Q.bloom, [rt.createView()]); bgO = bgr(Q.out, [rt.createView(), bt.createView(), Q.sm]);
     }
     bg = bgr(blit, [(lt || rt).createView(), { buffer: bb }]);
@@ -259,9 +318,9 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const panel = $('#s'); let row = 0, aSel = 0;
   const opened = () => panel.classList.contains('on');
   const syncPanel = () => {
-    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge, dith, leaf: leafOff ? 0 : leaf === 'auto' ? (hq ? 2 : 1) : +leaf }[e.dataset.k])));
+    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge, dith, sikt, leaf: leafOff ? 0 : leaf === 'auto' ? (hq ? 2 : 1) : +leaf }[e.dataset.k])));
     panel.querySelectorAll('p').forEach((e, i) => e.classList.toggle('f', i === row));
-    panel.querySelectorAll('[data-a]').forEach((e, i) => e.classList.toggle('on', row === 5 && i === aSel));
+    panel.querySelectorAll('[data-a]').forEach((e, i) => e.classList.toggle('on', row === 6 && i === aSel));
   };
   const ACT = { exp: exportWorld, imp: () => fileIn.click(), shr: shareLink };
   const runAct = () => ACT[panel.querySelectorAll('[data-a]')[aSel].dataset.a]();
@@ -270,6 +329,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     else if (k === 'leaf') { leaf = v; localStorage.setItem('m7c-leaf', v); resize(); }
     else if (k === 'dith') { dith = v; localStorage.setItem('m7c-dither', v); bset(); }
     else if (k === 'edge') { if (edge !== +v) { edge = +v; localStorage.setItem('m7c-edge', v); AREA = area0(); slow = fast = 0; ceil = 1e9; resize(); } }
+    else if (k === 'sikt') { sikt = +v; localStorage.setItem('m7c-view', v); resize(); }
     else { tod = v; localStorage.setItem('m7c-tod', v); }
     syncPanel();
   };
@@ -309,12 +369,12 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   };
   const togglePanel = () => { if (panel.classList.toggle('on') && document.pointerLockElement) document.exitPointerLock(); syncPanel(); };
   const stepOpt = (dir) => {
-    if (row === 5) { aSel = (aSel + dir + 3) % 3; return syncPanel(); }
+    if (row === 6) { aSel = (aSel + dir + 3) % 3; return syncPanel(); }
     const o = [...panel.querySelectorAll('p')[row].querySelectorAll('i')], i = o.findIndex((e) => e.classList.contains('on')), e = o[(i + dir + o.length) % o.length]; setOpt(e.dataset.k, e.dataset.v);
   };
-  const moveRow = (dir) => { row = (row + dir + 6) % 6; syncPanel(); };
-  const enter = () => (row === 5 ? runAct() : stepOpt(1));
-  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = ['fx', 'tod', 'edge', 'dith', 'leaf'].indexOf(d.k); setOpt(d.k, d.v); } if (d.a) { row = 5; aSel = Object.keys(ACT).indexOf(d.a); syncPanel(); ACT[d.a](); } });
+  const moveRow = (dir) => { row = (row + dir + 7) % 7; syncPanel(); };
+  const enter = () => (row === 6 ? runAct() : stepOpt(1));
+  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = ['fx', 'tod', 'edge', 'dith', 'leaf', 'sikt'].indexOf(d.k); setOpt(d.k, d.v); } if (d.a) { row = 6; aSel = Object.keys(ACT).indexOf(d.a); syncPanel(); ACT[d.a](); } });
   $('#g').addEventListener('click', togglePanel);
   for (const el of [panel, $('#g')]) el.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
   syncPanel();
@@ -422,10 +482,10 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const dz = (v) => (Math.abs(v) < 0.15 ? 0 : (v - Math.sign(v) * 0.15) / 0.85);
 
   // ---------- frame ----------
-  const U = new Float32Array(80), TLB = new Float32Array(128);
+  const U = new Float32Array(88), TLB = new Float32Array(128);
   let last = performance.now(), acc = 0, frames = 0, slow = 0, fast = 0, ceil = 1e9, warm = 0; const fixedArea = qs.has('area');
   // debug: ?p=x,y teleport, ?t=seconds time offset, ?pt=pitch
-  if (qs.get('p')) { const [x, y] = qs.get('p').split(',').map(Number); const hm8 = new Uint8Array(mem(), X.height_ptr(), N * N); st[0] = x + 0.5; st[1] = y + 0.5; st[2] = hm8[y * N + x] + 2; }
+  if (qs.get('p')) { const [x, y] = qs.get('p').split(',').map(Number); const hm8 = H8(); st[0] = x + 0.5; st[1] = y + 0.5; st[2] = hm8[y * N + x] + 2; }
   if (qs.get('pt')) pitch = +qs.get('pt');
   const t0 = +qs.get('t') || 0;
   // HQ sun: 'day' = the classic fixed sun; 'eve' = golden hour; 'cyc' = 4 min day/night; ?tod=hours
@@ -446,16 +506,20 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const draw = (fb) => {
     const enc = dev.createCommandEncoder();
     // re-bake the sun-shadow cache only when the sun has moved > ~0.4 deg or the world changed
-    if (hq && (fb || bakeDirty || !bakedL || (sunD[0] * bakedL[0] + sunD[1] * bakedL[1] + sunD[2] * bakedL[2]) / Math.hypot(...sunD) / Math.hypot(...bakedL) < 0.999976)) {
-      const c = enc.beginComputePass(); c.setPipeline(Q.bake); c.setBindGroup(0, Q.bg); c.dispatchWorkgroups(N * N * NZ / 256); c.end(); enc.copyBufferToBuffer(scb, 0, scb2, 0, N * N * NZ);
-      bakedL = sunD; bakeDirty = false; bakes++;
+    U.set([wx, wy, WS], 81); dev.queue.writeBuffer(ub, 81 * 4, U, 81, 3);   // the window the bake below covers (also before the first frame)
+    if (hq && (fb || bakeDirty || bakedW !== wx + ',' + wy || !bakedL || (sunD[0] * bakedL[0] + sunD[1] * bakedL[1] + sunD[2] * bakedL[2]) / Math.hypot(...sunD) / Math.hypot(...bakedL) < 0.999976)) {
+      const c = enc.beginComputePass(); c.setPipeline(Q.bake); c.setBindGroup(0, Q.bg); c.dispatchWorkgroups(WS * WS * NZ / 1024); c.end();
+      bakedL = sunD; bakedW = wx + ',' + wy; bakeDirty = false; bakes++;
     }
+    if (hq && leafDirty) leafList();
+    const nSpl = hq && leafM() === 2 && nLeaf ? Math.min(SPLATS, nLeaf * splatK()) : 0;
+    if (nSpl) { U[85] = nSpl; dev.queue.writeBuffer(ub, 85 * 4, U, 85, 1); const c = enc.beginComputePass(); c.setPipeline(Q.slit); c.setBindGroup(0, Q.bgL); c.dispatchWorkgroups(Math.ceil(nSpl / 64)); c.end(); }
     if (hq) {
       // HQ scene writes depth; leaf splats (Löv+splats) are depth-tested against it in the same pass
       if (leafDirty) leafList();
       const p = enc.beginRenderPass({ colorAttachments: [{ view: rt.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }], depthStencilAttachment: { view: dt.createView(), depthLoadOp: 'clear', depthClearValue: 1, depthStoreOp: 'discard' } });
       p.setPipeline(SP); p.setBindGroup(0, sg); p.draw(3);
-      if (leafM() === 2 && nLeaf) { p.setPipeline(Q.splat); p.setBindGroup(0, sgS); p.draw(6, nLeaf * splatK()); }
+      if (nSpl) { p.setPipeline(Q.splat); p.setBindGroup(0, sgS); p.draw(6, nSpl); }
       p.end();
     } else pass(enc, rt, SP, sg);
     if (hq) { pass(enc, bt, Q.bloom, bgB); pass(enc, lt, Q.out, bgO); }
@@ -511,7 +575,11 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     const F = [fx * cp, fy * cp, -sp], R = [fy, -fx, 0], Up = [R[1] * F[2] - R[2] * F[1], R[2] * F[0] - R[0] * F[2], R[0] * F[1] - R[1] * F[0]];
     const tx = st[0], ty = st[1], tz = cz + (V.fps ? 1.55 : 0.9);
     const tanV = V.tan * Math.max(1, (ih / iw) * (V.fps ? 0.6 : 0.8));
-    const far = V.fps ? 64 : V.fog ? dist * 3.2 : dist * 6;
+    const far = (V.fps ? 64 : V.fog ? dist * 3.2 : dist * 6) * SIKT[sikt].m;
+    // far field: past tH a block is ~1 art pixel -> 2.5D heightmap march (?hmk scales it; 0 = voxels only)
+    const hmk = qs.has('hmk') ? +qs.get('hmk') : 1, tH = hmk ? ih / Math.max(art, 1) / (2 * tanV) / hmk : 1e9;
+    // shadow-cache window: centred ahead of the camera, snapped to 16 blocks (re-bakes only when it moves)
+    if (WS && WS < N) { const fl = Math.hypot(F[0], F[1]) || 1, k = Math.min(far, 60) * 0.4; wx = Math.max(0, Math.min(N - WS, Math.round((tx + F[0] / fl * k - WS / 2) / 16) * 16)); wy = Math.max(0, Math.min(N - WS, Math.round((ty + F[1] / fl * k - WS / 2) / 16) * 16)); } else wx = wy = 0;
     Object.assign(cam, { o: [tx - F[0] * dist, ty - F[1] * dist, tz - F[2] * dist], F, R, Up, tan: tanV });
     // highlight target: crosshair in FPS, pointer (mouse) or block in front (pad/keys/touch) elsewhere
     hl = V.fps ? target('center') : aim === 'pointer' && ptr && mode === 'kb' ? target('pointer', ptr[0], ptr[1]) : mode === 'touch' ? null : target('front');
@@ -520,6 +588,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     while (parts.length && parts[parts.length - 1].life <= 0) parts.pop();
     U.fill(0);
     U.set([iw, ih, now / 1000 + t0, tanV, ...cam.o, V.fog, ...F, far, ...R, iw / ih, ...Up, leafM(), st[0], st[1], st[2], nLeaf, st[4], st[5], st[6], st[7], V.fps ? 1 : 0, 0, 0, 0]);
+    U.set([tH, wx, wy, WS, FOGS], 80);   // edge fog over the last 45% of the view distance (?fogs = start fraction, 0.35 = v10)
     if (hl) U.set([...hl.b, 1], 32);
     U[39] = edge === 1 ? -1 : art;
     if (hq) { const [d, c, sky, w] = sun(now / 1000 + t0); U.set(sky, 29); U.set([...d, 0, ...c, w], 72); sunD = d; }
@@ -548,7 +617,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
       acc = 0; frames = 0;
     }
   };
-  window.m7 = { act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; }, get area() { return AREA; }, get splats() { return leafM() === 2 ? nLeaf * splatK() : 0; }, get leaves() { return nLeaf; } }; // handy for tests
+  window.m7 = { act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; }, get area() { return AREA; }, get splats() { return leafM() === 2 ? nLeaf * splatK() : 0; }, get leaves() { return nLeaf; }, get sikt() { return sikt; }, get migrated() { return migrated; }, gpuMem: () => { const o = {}; let t = 0; for (const [k, b] of gmem.values()) { o[k] = (o[k] || 0) + b; t += b; } const sw = W * H * 4 * 3; return { total: t, swapchain3: sw, all: t + sw, ...o }; } }; // handy for tests
   // shared world link (#w=...): load it, then drop the hash so later local edits stay local
   const hw = location.hash.match(/^#w=([\w-]+)/);
   if (hw) { history.replaceState(null, '', location.pathname + location.search); try { await importBytes(unb64(hw[1])); } catch { toast('Ogiltig l\u00e4nk'); } }
