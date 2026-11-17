@@ -95,16 +95,18 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const scene = mk(SCENE_WGSL, 'rgba8unorm'), blit = mk(BLIT_WGSL, fmt);
   // HQ setting: same scene shader with the HQ override on (HDR target) + bloom + tonemap passes.
   // Built and allocated only when HQ is switched on; standard mode never touches any of it.
-  const fxq = qs.get('fx'); let hq = fxq != null ? fxq === '1' : localStorage.getItem('m7c-fx') === '1';
-  const tq = qs.get('tod'); let tod = tq != null ? (isNaN(+tq) ? tq : +tq) : localStorage.getItem('m7c-tod') || 'day', Q = null, bt, lt, bgB, bgO;
+  const fxq = qs.get('fx'); let hq = (fxq ?? localStorage.getItem('m7c-fx') ?? '1') === '1';
+  const tq = qs.get('tod'); let tod = tq != null ? (isNaN(+tq) ? tq : +tq) : localStorage.getItem('m7c-tod') || 'cyc', Q = null, bt, lt, bgB, bgO;
   const hqP = () => Q ||= { bake: dev.createComputePipeline({ layout: 'auto', compute: { module: dev.createShaderModule({ code: SCENE_WGSL }), entryPoint: 'bake' } }), scene: mk(SCENE_WGSL, 'rgba16float', 'fs', { HQ: 1 }), bloom: mk(HQ_WGSL, 'rgba16float', 'fb'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
   const bgr = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map((resource, binding) => ({ binding, resource })) });
   // edges: 0 Pixel (classic), 1 Mjuka (edge-smoothing upscale), 2 Skarpa (near-native rays, art-size texels)
-  const eq = qs.get('edge'); let edge = +(eq ?? localStorage.getItem('m7c-edge') ?? 0) % 3 || 0, art = 0;
-  const area0 = () => edge === 2 ? (hq ? 500000 : 1000000) : hq ? 70000 : 115000;
+  const eq = qs.get('edge'); let edge = +(eq ?? localStorage.getItem('m7c-edge') ?? 2) % 3 || 0, art = 0;
+  // internal-pixel budget: Skarpa starts at 40% of its cap and dynamic resolution climbs while frames are fast
+  const amax = () => edge === 2 ? (hq ? 500000 : 1000000) : hq ? 70000 : 115000;
+  const area0 = () => edge === 2 ? amax() * 0.4 : amax();
   let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = +qs.get("area") || area0(), cross = 0;
   // ordered 4x4 Bayer dithering to a limited palette in the upscale: 'auto' = HQ only, '1' on, '0' off
-  const dq = qs.get('dither'); let dith = dq ?? localStorage.getItem('m7c-dither') ?? 'auto';
+  const dq = qs.get('dither'); let dith = dq ?? localStorage.getItem('m7c-dither') ?? '0';
   const bset = () => dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, art, (edge === 1 ? 1 : 0) + (dith === '1' || (dith === 'auto' && hq) ? 2 : 0)]));
   const resize = () => {
     const d = Math.min(devicePixelRatio || 1, 3);
@@ -211,9 +213,9 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const ACT = { exp: exportWorld, imp: () => fileIn.click(), shr: shareLink };
   const runAct = () => ACT[panel.querySelectorAll('[data-a]')[aSel].dataset.a]();
   const setOpt = (k, v) => {
-    if (k === 'fx') { if (hq !== (v === '1')) { hq = v === '1'; localStorage.setItem('m7c-fx', +hq); AREA = area0(); slow = 0; resize(); } }
+    if (k === 'fx') { if (hq !== (v === '1')) { hq = v === '1'; localStorage.setItem('m7c-fx', +hq); AREA = area0(); slow = fast = 0; ceil = 1e9; resize(); } }
     else if (k === 'dith') { dith = v; localStorage.setItem('m7c-dither', v); bset(); }
-    else if (k === 'edge') { if (edge !== +v) { edge = +v; localStorage.setItem('m7c-edge', v); AREA = area0(); slow = 0; resize(); } }
+    else if (k === 'edge') { if (edge !== +v) { edge = +v; localStorage.setItem('m7c-edge', v); AREA = area0(); slow = fast = 0; ceil = 1e9; resize(); } }
     else { tod = v; localStorage.setItem('m7c-tod', v); }
     syncPanel();
   };
@@ -333,7 +335,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
 
   // ---------- frame ----------
   const U = new Float32Array(80), TLB = new Float32Array(128);
-  let last = performance.now(), acc = 0, frames = 0, slow = 0;
+  let last = performance.now(), acc = 0, frames = 0, slow = 0, fast = 0, ceil = 1e9, warm = 0; const fixedArea = qs.has('area');
   // debug: ?p=x,y teleport, ?t=seconds time offset, ?pt=pitch
   if (qs.get('p')) { const [x, y] = qs.get('p').split(',').map(Number); const hm8 = new Uint8Array(mem(), X.height_ptr(), N * N); st[0] = x + 0.5; st[1] = y + 0.5; st[2] = hm8[y * N + x] + 2; }
   if (qs.get('pt')) pitch = +qs.get('pt');
@@ -368,7 +370,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   // test hook: mean GPU frame time (ms) over n frames, each awaited to completion
   const bench = async (n, fb) => { await dev.queue.onSubmittedWorkDone(); const t = Date.now(); for (let i = 0; i < n; i++) { draw(fb); await dev.queue.onSubmittedWorkDone(); } return { ms: (Date.now() - t) / n, iw, ih, hq }; };
   const frame = (now) => {
-    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    const rdt = (now - last) / 1000, dt = Math.min(0.05, rdt); last = now;
     let mx = 0, my = 0, jump = jumpQ; jumpQ = false;
     run = keys.has('ShiftLeft') || keys.has('ShiftRight');
     mx += (keys.has('KeyD') || keys.has('ArrowRight') ? 1 : 0) - (keys.has('KeyA') || keys.has('ArrowLeft') ? 1 : 0);
@@ -433,12 +435,20 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     if ((V.fps | 0) !== cross) { cross = V.fps | 0; bset(); }
     dev.queue.writeBuffer(ub, 0, U);
     draw();
-    // adaptive resolution: drop internal pixels if we can't hold ~45fps
-    acc += dt; frames++;
-    if (acc > 1) { if (acc / frames > 0.022 && AREA > (hq ? 25000 : 45000)) { if (++slow >= 2) { AREA *= 0.75; resize(); slow = 0; } } else slow = 0; acc = 0; frames = 0; }
+    acc += Math.min(rdt, 0.5); frames++;   // real frame time (dt is clamped for physics)
+    // adaptive resolution, checked every second: below ~45 fps for 2 s (or below ~20 fps at once) steps down;
+    // ~55+ fps for 3 s steps up towards the mode's cap, never back above a level that was too slow
+    if (acc > 1 && warm++ < 2) { acc = 0; frames = 0; }   // skip the first 2 s (pipeline compile, world upload)
+    if (acc > 1) {
+      const ft = acc / frames, lo = hq ? 25000 : 45000;
+      if (ft > 0.022 && AREA > lo) { fast = 0; if (ft > 0.05 || ++slow >= 2) { if (slow) ceil = AREA * 0.95; AREA = Math.max(lo, AREA * (ft > 0.05 ? 0.6 : 0.75)); resize(); slow = 0; } }
+      else if (ft < 0.0185 && !fixedArea && AREA < Math.min(amax(), ceil) * 0.99) { slow = 0; if (++fast >= 3) { AREA = Math.min(AREA * 1.25, amax(), ceil); resize(); fast = 0; } }
+      else slow = fast = 0;
+      acc = 0; frames = 0;
+    }
     requestAnimationFrame(frame);
   };
-  window.m7 = { act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; } }; // handy for tests
+  window.m7 = { act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; }, get area() { return AREA; } }; // handy for tests
   // shared world link (#w=...): load it, then drop the hash so later local edits stay local
   const hw = location.hash.match(/^#w=([\w-]+)/);
   if (hw) { history.replaceState(null, '', location.pathname + location.search); try { await importBytes(unb64(hw[1])); } catch { toast('Ogiltig l\u00e4nk'); } }
