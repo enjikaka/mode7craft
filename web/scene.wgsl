@@ -6,11 +6,12 @@ struct V { @builtin(position) p: vec4f };
   var o: V; let x = f32((i << 1u) & 2u); let y = f32(i & 2u);
   o.p = vec4f(x * 2. - 1., 1. - y * 2., 0., 1.); return o;
 }
-@group(0) @binding(0) var<uniform> U: array<vec4f, 22>;   // U[9].z = torch count, U[9].w = art-pixel scale ('Skarpa kanter'; 0 = off, -1 = write surface ids for 'Mjuka kanter')
+@group(0) @binding(0) var<uniform> U: array<vec4f, 30>;   // U[9].z = torch count, U[9].w = art-pixel scale ('Skarpa kanter'; 0 = off, -1 = write surface ids for 'Mjuka kanter')
 @group(0) @binding(1) var vox: texture_3d<u32>;
 @group(0) @binding(2) var hm: texture_2d<u32>;   // r16: terrain h | top-of-anything h << 5 | top id << 10
 @group(0) @binding(8) var OCC: texture_3d<u32>;    // 4x4x4 bricks: 0 = nothing visible (empty-space skipping)
-// U[20] = (heightmap-march start tH, shadow-cache window x0, y0, size), U[21] = (edge-fog start fraction, splat count, -, -)
+// U[20] = (heightmap-march start tH, shadow-cache window x0, y0, size), U[21] = (edge-fog start fraction, remote player count, -, -)
+// U[22 + 2k], U[23 + 2k] = remote player k (v12 multiplayer, k < 4): position, (facing xy, walk phase, swing); same layout as U[5], U[6]
 @group(0) @binding(3) var<uniform> TL: array<vec4f, 32>;   // nearest torches: xyz + flicker (own buffer: keeps U small)
 // HQ sun-shadow cache, one byte per block cell (4 per u32): 0 = all dark, 255 = all lit, 128 = mixed/unknown.
 // Baked by the `bake` compute pass only when the sun moves or the world changes.
@@ -38,15 +39,15 @@ fn height(b: vec2i) -> i32 {
   if (b.x < 0 || b.y < 0 || b.x >= N || b.y >= N) { return 0; }
   return i32(textureLoad(hm, b, 0).r & 31u);
 }
-// sprite-stacked avatar, ids 10.. ; t = texel coords
-fn player(t: vec3i) -> u32 {
-  let P = U[5]; let dz = t.z - i32(floor(P.z * S + 0.01));
+// sprite-stacked avatar, ids 10.. (remote players: shirt = 16 + k); t = texel coords, P/F4 = U[5]/U[6] layout
+fn player(t: vec3i, P: vec4f, F4: vec4f, sh: u32) -> u32 {
+  let dz = t.z - i32(floor(P.z * S + 0.01));
   if (dz < 0 || dz > 14) { return 0u; }
   let d = vec2f(t.xy) + 0.5 - P.xy * S;
   if (dot(d, d) > 20.) { return 0u; }
-  let f = U[6].xy; let v = dot(d, f); let u = dot(d, vec2f(f.y, -f.x));
+  let f = F4.xy; let v = dot(d, f); let u = dot(d, vec2f(f.y, -f.x));
   let iu = i32(floor(u + 0.5)) ; let iv = i32(floor(v + 0.5));
-  let sw = i32(round(sin(U[6].z) * 1.6 * U[6].w));
+  let sw = i32(round(sin(F4.z) * 1.6 * F4.w));
   if (dz <= 4) {
     let m = select(10u, 15u, dz == 0);
     if ((iu == -1 || iu == -2) && (iv - sw == -1 || iv - sw == 0)) { return m; }
@@ -54,8 +55,8 @@ fn player(t: vec3i) -> u32 {
     return 0u;
   }
   if (dz <= 9) {
-    if (iu >= -2 && iu <= 1 && (iv == -1 || iv == 0)) { return 11u; }
-    if (dz >= 5 && ((iu == -3 && (iv + sw == -1 || iv + sw == 0)) || (iu == 2 && (iv - sw == -1 || iv - sw == 0)))) { return select(11u, 12u, dz == 5); }
+    if (iu >= -2 && iu <= 1 && (iv == -1 || iv == 0)) { return sh; }
+    if (dz >= 5 && ((iu == -3 && (iv + sw == -1 || iv + sw == 0)) || (iu == 2 && (iv - sw == -1 || iv - sw == 0)))) { return select(sh, 12u, dz == 5); }
     return 0u;
   }
   if (iu >= -2 && iu <= 1 && iv >= -2 && iv <= 1) {
@@ -249,9 +250,9 @@ fn hmIn(p: vec3f) -> bool {
   return p.z < f32((textureLoad(hm, c, 0).r >> 5u) & 31u);
 }
 // Exact texel DDA through the sprite-stacked avatar's bounding box (texel space).
-fn tracePlayer(ro: vec3f, rd: vec3f, tB: f32) -> Hit {
+fn tracePlayer1(ro: vec3f, rd: vec3f, tB: f32, P: vec4f, F4: vec4f, sh: u32) -> Hit {
   var h: Hit; h.t = tB; h.id = 0u; h.n = vec3f(0., 0., 1.);
-  let P = U[5]; let z0 = floor(P.z * S + 0.01);
+  let z0 = floor(P.z * S + 0.01);
   let o = ro * S; let inv = sinv(rd); var n = vec3f(0., 0., 1.);
   let r = slab(o, inv, rd, vec3f(P.xy * S - 5., z0), vec3f(P.xy * S + 5., z0 + 15.), &n);
   if (r.x > r.y || r.y < 0. || r.x > tB * S) { return h; }
@@ -261,7 +262,7 @@ fn tracePlayer(ro: vec3f, rd: vec3f, tB: f32) -> Hit {
   let dl = abs(inv);
   var tm = (vec3f(c) + select(vec3f(0.), vec3f(1.), rd > vec3f(0.)) - o) * inv;
   for (var i = 0; i < 40; i++) {
-    let id = player(c);
+    let id = player(c, P, F4, sh);
     if (id != 0u) { if (t / S < tB) { h.t = t / S; h.id = id; h.n = n; } return h; }
     if (tm.x < tm.y && tm.x < tm.z) { t = tm.x; tm.x += dl.x; c.x += st.x; n = vec3f(f32(-st.x), 0., 0.); }
     else if (tm.y < tm.z) { t = tm.y; tm.y += dl.y; c.y += st.y; n = vec3f(0., f32(-st.y), 0.); }
@@ -270,10 +271,18 @@ fn tracePlayer(ro: vec3f, rd: vec3f, tB: f32) -> Hit {
   }
   return h;
 }
+// all avatars: the local one (me = false in first person) + the remote players; nearest hit wins
+fn tracePlayer(ro: vec3f, rd: vec3f, tB: f32, me: bool) -> Hit {
+  var h: Hit; h.t = tB; h.id = 0u; h.n = vec3f(0., 0., 1.);
+  if (me) { h = tracePlayer1(ro, rd, tB, U[5], U[6], 11u); }
+  let n = u32(U[21].y);
+  for (var k = 0u; k < n; k++) { let q = tracePlayer1(ro, rd, h.t, U[22u + 2u * k], U[23u + 2u * k], 16u + u32(U[22u + 2u * k].w)); if (q.id != 0u) { h = q; } }
+  return h;
+}
 // 1 = lit, 0 = shadowed (blocks, avatar, clouds)
 fn shadow(p: vec3f) -> f32 {
   if (traceBlocks(p, SUN, 0.0, 16., 28).id != 0u) { return 0.; }
-  if (tracePlayer(p, SUN, 16.).id != 0u) { return 0.; }
+  if (tracePlayer(p, SUN, 16., true).id != 0u) { return 0.; }
   let qc = p.xy + SUN.xy * ((CB + 0.6 - p.z) / SUN.z);
   if (cloud((floor(qc * S) + .5) / S) > 0.) { return 0.; }
   return 1.;
@@ -314,6 +323,10 @@ fn matCol(id: u32, t: vec3i, face: i32) -> vec3f {
     case 12u: { c = c3(0xe0a878u); }
     case 13u: { c = c3(0x4a3020u); }
     case 14u: { c = c3(0x1a1a2au); }
+    case 16u: { c = c3(0xc8443au); }
+    case 17u: { c = c3(0x4fae4au); }
+    case 18u: { c = c3(0xe0b83au); }
+    case 19u: { c = c3(0x9a52c8u); }
     default: { c = c3(0x2a2a2au); }
   }
   return c;
@@ -371,7 +384,7 @@ fn water(d: vec3f, p: vec3f, sh: f32, dark: bool) -> WR {
     // see-through: refracted ray to the sea floor / object bases / the avatar's legs (open deep sea is opaque: skipped)
     let rd = refract(d, vec3f(0., 0., 1.), 0.75);
     var h = traceBlocks(p, rd, 0., min(p.z / max(-rd.z, 0.1), 8.), 12);
-    if (U[7].x < 0.5) { let hp = tracePlayer(p, rd, h.t); if (hp.id != 0u) { h = hp; } }
+    let hp = tracePlayer(p, rd, h.t, U[7].x < 0.5); if (hp.id != 0u) { h = hp; }
     let q = p + rd * h.t;
     if (h.id != 0u) {
       let ht = vec3i(floor((q - h.n * 0.002) * S));
@@ -409,11 +422,7 @@ fn water(d: vec3f, p: vec3f, sh: f32, dark: bool) -> WR {
 }
 fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z * 3., 0., 1.)); }
 
-var<private> gZ = 1.;   // HQ: depth of the visible surface (for the leaf splats' depth test)
-fn zdep(t: f32, d: vec3f) -> f32 { return 1. - 0.05 / max(t * dot(d, U[2].xyz), 0.05); }
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f { return shade(fc); }
-struct FO { @location(0) c: vec4f, @builtin(frag_depth) z: f32 };
-@fragment fn fsh(@builtin(position) fc: vec4f) -> FO { let c = shade(fc); return FO(c, gZ); }
 fn shade(fc: vec4f) -> vec4f {
   let res = U[0].xy; let uv = fc.xy / res * 2. - 1.;
   let nd = vec2f(uv.x * U[3].w, -uv.y) * U[0].w;
@@ -456,14 +465,14 @@ fn shade(fc: vec4f) -> vec4f {
   }
   let cloudCol = mix(cc, sky(d), fogOn * smoothstep(far * U[21].x, far, ct));
   // camera above the cloud layer: nothing can be in front of a cloud hit
-  if (ca > 0.5 && o.z > CB + 1.3) { if (HQ) { gZ = zdep(ct, d); return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
+  if (ca > 0.5 && o.z > CB + 1.3) { if (HQ) { return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
   // ---- terrain: exact DDA through the block grid, then the avatar ----
   let tw = select(1e9, (ZW - o.z) / d.z, d.z < 0.);
   let tEnd = select(min(far, tw), min(ct, tw), ca > 0.5);
   let tH = U[20].x;
   var hb = traceBlocks(o, d, 0., min(tEnd, tH), 320);
   if (hb.id == 0u && tEnd > tH) { hb = hmMarch(o, d, tH, tEnd); }
-  if (!fps) { let hp = tracePlayer(o, d, hb.t); if (hp.id != 0u) { hb = hp; } }
+  let hp = tracePlayer(o, d, hb.t, !fps); if (hp.id != 0u) { hb = hp; }
   // break particles: tiny analytic cubes
   var part = false;
   if (U[9].y > 0.5) {
@@ -481,7 +490,7 @@ fn shade(fc: vec4f) -> vec4f {
     if (r.x <= r.y && r.x > 0. && r.x < hb.t) { hb.t = r.x; hb.id = 8u; hb.n = tn; part = false; }
   }
   var col: vec3f; var tt = hb.t; var gid = 251.;   // surface id (sky 251, water 250, planes 0..239, avatar 253)
-  if (hb.id == 0u && ca > 0.5 && ct < tw) { if (HQ) { gZ = zdep(ct, d); return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
+  if (hb.id == 0u && ca > 0.5 && ct < tw) { if (HQ) { return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
   if (hb.id == 0u) {
     if (tw > far) { col = sky(d); tt = 0.; if (HQ) { col = hqSky(d); tt = far; } }
     else {
@@ -539,7 +548,7 @@ fn shade(fc: vec4f) -> vec4f {
     }
   }
   let ga = select(1., gid / 255., U[9].w < 0.);
-  if (HQ) { if (tt > 0. && tt < far * 0.999) { gZ = zdep(tt, d); } return vec4f(hqAtmo(o, d, tt, far, fogOn, col, fc.xy), ga); }
+  if (HQ) { return vec4f(hqAtmo(o, d, tt, far, fogOn, col, fc.xy), ga); }
   col = mix(col, sky(d), fogOn * smoothstep(far * U[21].x, far, tt));
   return vec4f(col, ga);
 }
@@ -636,7 +645,7 @@ fn hqShadow(p: vec3f, k: f32) -> f32 {
   for (var i = 0; i < 3; i++) {
     let a = (f32(i) + k) * 2.0944; let r = normalize(L + (t1 * cos(a) + t2 * sin(a)) * 0.075);
     // baked fully-lit cells only test the (moving) avatar; mixed cells trace the world as before
-    if (tracePlayer(p, r, 16.).id == 0u) { if (sc == 255u) { v += 1.; } else { v += hqTrans(p, r, 28); } }
+    if (tracePlayer(p, r, 16., true).id == 0u) { if (sc == 255u) { v += 1.; } else { v += hqTrans(p, r, 28); } }
   }
   let qc = p.xy + L.xy * ((CB + 0.6 - p.z) / L.z);
   return v / 3. * select(1., 0.3, cloud((floor(qc * S) + .5) / S) > 0.);
@@ -771,73 +780,4 @@ fn hqAtmo(o: vec3f, d: vec3f, tt: f32, far: f32, fogOn: f32, col: vec3f, fc: vec
   let dens = 1. - exp(-len * 0.006);
   var c = col + U[19].xyz * (vis / 6.) * ph * (1. - exp(-len * 0.03)) * 0.12 + U[7].yzw * dens * 0.02;
   return mix(c, hqSky(d), fogOn * smoothstep(far * U[21].x, far, tt));
-}
-
-// ---- leaf splats (v10, HQ 'Löv+splats'): small swaying gaussian leaf sprites on the crown surface ----
-// LF = exposed leaf voxels (index | open-face mask << 20), U[5].w = their count. Instance i is splat
-// i / count of voxel i % count, so drawing fewer instances thins every crown evenly.
-@group(0) @binding(5) var<storage, read> LF: array<u32>;
-struct SV { @builtin(position) p: vec4f, @location(0) @interpolate(flat) c: vec4f, @location(1) q: vec2f };
-struct SPL { P: vec3f, r: vec4f, fn3: vec3f, ok: bool };
-// splat i: its (swaying) centre, random numbers and face; ok = survives distance thinning + view cull
-fn splat(ii: u32) -> SPL {
-  var s: SPL;
-  let nv = u32(U[5].w); let e = LF[ii % nv]; let k = ii / nv; let ix = i32(e & 0xfffffu); let m = e >> 20u;
-  let cell = vec3i(ix % N, (ix / N) % N, ix / (N * N));
-  // hash of the cell as indexed on the old 128 island, so legacy splats match v10
-  let h = hh((u32((cell.z * 128 + cell.y) * 128 + cell.x) | (m << 18u)) * 31u + k * 977u); s.r = vec4f(vec4u(h, h >> 8u, h >> 16u, h >> 24u) & vec4u(255u)) / 255.;
-  // pick the (k-th) open face, sit on it and poke a little outwards
-  var f = 0u; var c = 0u; let want = (k + h) % u32(countOneBits(m));
-  for (var j = 0u; j < 6u; j++) { if (((m >> j) & 1u) != 0u) { if (c == want) { f = j; } c++; } }
-  var n3 = vec3f(0.); n3[f / 2u] = select(-1., 1., (f & 1u) == 0u); s.fn3 = n3;
-  let t = U[0].z; var P = vec3f(cell) + .5 + (s.r.xyz - .5) * 0.9 * (1. - abs(s.fn3)) + s.fn3 * (0.45 + s.r.w * 0.3);
-  let ph = P.x * 0.7 + P.y * 0.9 + s.r.w * 6.3; let gust = 1. + 0.6 * sin(t * 0.37 + P.x * 0.06 + P.y * 0.04);
-  P += (vec3f(sin(t * 1.6 + ph), cos(t * 1.3 + ph * 1.7), 0.) * 0.035 + vec3f(0., 0., sin(t * 2.1 + ph) * 0.015)) * gust;
-  s.P = P; let v = P - U[1].xyz; let dist = length(v);
-  // distance thinning (keep ~2 per voxel far away) + view cull
-  s.ok = !(dot(v, U[2].xyz) < 1.2 || dist > U[2].w * 0.85 || f32(k) >= 8. * clamp(10. / dist, 0.3, 1.));
-  return s;
-}
-// v11: splat lighting runs once per splat in this compute pass (it used to run in all 6 vertices);
-// SPW[i] = lit + fogged colour as 4 halfs, alpha 0 = culled
-@group(0) @binding(9) var<storage, read_write> SPW: array<vec2u>;
-@compute @workgroup_size(64) fn slit(@builtin(global_invocation_id) g: vec3u) {
-  if (g.x >= u32(U[21].y)) { return; }
-  let s = splat(g.x); if (!s.ok) { SPW[g.x] = vec2u(0u); return; }
-  let P = s.P; let r = s.r; let v = P - U[1].xyz; let dist = length(v);
-  // sun (baked cache, else one transmittance ray) + sky, palette-snapped
-  let L = sunL(); let nr = normalize(s.fn3 + (r.zxy - .5) * 0.9 + vec3f(0., 0., 0.35));
-  var sh = 0.;
-  if (L.z > 0.02) {
-    let sc = scache(vec3i(floor(P))); sh = select(select(hqTrans(P, L, 12), 1., sc == 255u), 0., sc == 0u);
-    let qc = P.xy + L.xy * ((CB + 0.6 - P.z) / L.z); if (cloud((floor(qc * S) + .5) / S) > 0.) { sh *= 0.3; }
-  }
-  let ndl = dot(nr, L); let lit = floor((max(ndl, 0.) + max(-ndl, 0.) * 0.35) * sh * 4. + 0.5) / 4.;
-  let pal = array<u32, 4>(0x4f7d24u, 0x6fa233u, 0x86b83au, 0xa6d24eu);
-  let alb = lin(c3(pal[min(u32(r.z * 4.), 3u)]));
-  var col = alb * (U[19].xyz * lit + U[7].yzw * (0.9 + 0.25 * nr.z));
-  if (U[9].z > 0.) { col += alb * torchL(P, nr, false) * 1.2; }
-  col = mix(col, hqSky(v / dist), U[1].w * smoothstep(U[2].w * U[21].x, U[2].w, dist));
-  SPW[g.x] = vec2u(pack2x16float(col.rg), pack2x16float(vec2f(col.b, 1.)));
-}
-@group(0) @binding(6) var<storage, read> SPC: array<vec2u>;
-@vertex fn svs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> SV {
-  var o: SV; o.p = vec4f(0., 0., 2., 1.);
-  let lc = SPC[ii]; if (lc.y == 0u) { return o; }
-  let s = splat(ii); let r = s.r;
-  let O = U[1].xyz; let F = U[2].xyz; let Rr = U[3].xyz; let Up = U[4].xyz; let v = s.P - O; let z = dot(v, F);
-  // leaf ellipse: ~0.16 x 0.08 blocks, at least ~1 art pixel wide, random roll
-  let pw = z * 2. * U[0].w / U[0].y * max(U[9].w, 1.);
-  let sx = max(0.13 + r.x * 0.08, pw * 1.1); let sy = max(sx * 0.55, pw * 0.8); let a = r.y * 6.2832;
-  let qv = vec2f(f32((0x1au >> vi) & 1u), f32((0x34u >> vi) & 1u)) * 4. - 2.;   // 2 triangles, +-2 sigma
-  let lq = vec2f(qv.x * sx, qv.y * sy); let rq = vec2f(cos(a) * lq.x - sin(a) * lq.y, sin(a) * lq.x + cos(a) * lq.y);
-  let w = v + Rr * rq.x + Up * rq.y; let zz = dot(w, F);
-  o.p = vec4f(dot(w, Rr) / (U[3].w * U[0].w), dot(w, Up) / U[0].w, zz - 0.05, zz); o.q = qv;
-  o.c = vec4f(unpack2x16float(lc.x), unpack2x16float(lc.y).x, select(1., 247. / 255., U[9].w < 0.));
-  return o;
-}
-// gaussian falloff, stochastic (art-pixel Bayer) alpha: order-independent, crisp pixel-art edges
-@fragment fn sfs(i: SV) -> @location(0) vec4f {
-  if (exp(-0.5 * dot(i.q, i.q)) < bayer4(vec2i(floor(i.p.xy / max(U[9].w, 1.)))) * 0.3 + 0.3) { discard; }   // mostly solid, thin dithered rim
-  return i.c;
 }

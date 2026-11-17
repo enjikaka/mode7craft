@@ -19,9 +19,9 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const dev = await ad.requestDevice();
   dev.addEventListener('uncapturederror', (e) => { console.error(e.error.message); warn('GPU: ' + e.error.message); });
   dev.lost.then((i) => fail('GPU device lost (' + i.reason + '): ' + i.message + ' \u2013 ladda om sidan.'));
-  // adapters that cannot use storage buffers in a stage (WebGPU compat-style limits): HQ needs them in the
-  // fragment stage (sun-shadow cache), leaf splats in the vertex stage. Undefined (e.g. Safari) = core = fine.
-  const noFS = dev.limits.maxStorageBuffersInFragmentStage === 0, noVS = dev.limits.maxStorageBuffersInVertexStage === 0;
+  // adapters that cannot use storage buffers in the fragment stage (WebGPU compat-style limits): HQ needs them
+  // there (sun-shadow cache). Undefined (e.g. Safari) = core = fine.
+  const noFS = dev.limits.maxStorageBuffersInFragmentStage === 0;
   const { instance } = await wasmP; const X = instance.exports;
   const mem = () => X.memory.buffer; let migrated = 0;
   const N = 256, NZ = 16, ON = 128;   // v11: 256x256 island (ON = pre-v11 size)
@@ -51,7 +51,10 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   if (qs.has('legacy')) saved.clear();
   for (const [i, id] of saved) { edits.set(i, id); X.set_block(i % N, (i / N | 0) % N, i / (N * N) | 0, id); }
   let saveT = 0;
-  const save = () => { clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem(KEY, [...edits].map(([i, id]) => i.toString(36) + id).join(',')); } catch {} }, 400); };
+  // noSave: while visiting someone else's world (multiplayer guest) nothing is written over your own save
+  let noSave = false, netEd = () => {};
+  const saveNow = () => { clearTimeout(saveT); if (!noSave) try { localStorage.setItem(KEY, [...edits].map(([i, id]) => i.toString(36) + id).join(',')); } catch {} };
+  const save = () => { clearTimeout(saveT); saveT = setTimeout(saveNow, 400); };
   if (migrated) save();   // the migrated edits go to the new key right away (the old key stays as a backup)
 
   // exact GPU memory bookkeeping (m7.gpuMem()): every texture/buffer we create, minus destroyed ones
@@ -83,12 +86,13 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   };
   uploadWorld();
   // partial upload: only the touched voxel pair, its column and its brick
-  const touch1 = (x, y, z, id) => {
+  const touch1 = (x, y, z, id, remote) => {
+    if (!remote) netEd(x, y, z, id);   // multiplayer: own edits go to the host (or, as host, to every guest)
     const w = W8(), i = (z * N + y) * N + (x & ~1);
     dev.queue.writeTexture({ texture: vox, origin: [x >> 1, y, z] }, new Uint8Array([w[i] | w[i + 1] << 4]), {}, [1, 1, 1]);
     dev.queue.writeTexture({ texture: hm, origin: [x, y] }, new Uint16Array([hmCol(w, H8(), x, y)]), {}, [1, 1]);
     dev.queue.writeTexture({ texture: occT, origin: [x >> 2, y >> 2, z >> 2] }, new Uint8Array([brick(w, x >> 2, y >> 2, z >> 2)]), {}, [1, 1, 1]);
-    edits.set((z * N + y) * N + x, id); save(); lightsT = 0; bakeDirty = leafDirty = true;
+    edits.set((z * N + y) * N + x, id); save(); lightsT = 0; bakeDirty = true;
   };
   // ---------- world files: 'M7C' + version 1 + flags (1 = deflate-raw) + 3 bytes per edit:
   // (index delta << 4 | id), indices sorted. Same bytes go base64url into share links (#w=...).
@@ -117,12 +121,12 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     genW(); edits.clear(); parts.length = 0;
     for (const [i, id] of m) { edits.set(i, id); X.set_block(i % N, (i / N | 0) % N, i / (N * N) | 0, id); }
     uploadWorld();
-    save(); lightsT = 0; cz = st[2]; bakeDirty = leafDirty = true;
+    save(); lightsT = 0; cz = st[2]; bakeDirty = true;
   };
   const ask = (m) => !edits.size || confirm(`Ers\u00e4tt din v\u00e4rld med den importerade (${m.size} \u00e4ndringar)?`);
   const toast = (m) => { hint.textContent = m; clearTimeout(toast.t); toast.t = setTimeout(setHint, 3500); };
   if (migrated) setTimeout(() => toast('Gammal v\u00e4rld flyttad till mitten av nya \u00f6n'), 600);
-  const importBytes = async (b) => { let m; try { m = await unpack(b); } catch { toast('Ogiltig v\u00e4rldsfil'); return 0; } if (!ask(m)) return 0; loadWorld(m); toast(`V\u00e4rld laddad: ${m.size} \u00e4ndringar`); return m.size; };
+  const importBytes = async (b) => { if (net.mp === 'guest') { toast('Du \u00e4r g\u00e4st i n\u00e5gon annans v\u00e4rld'); return 0; } let m; try { m = await unpack(b); } catch { toast('Ogiltig v\u00e4rldsfil'); return 0; } if (!ask(m)) return 0; loadWorld(m); for (const p of net.peers.values()) sendWorld(p); toast(`V\u00e4rld laddad: ${m.size} \u00e4ndringar`); return m.size; };
   const exportWorld = async () => {
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([await pack()], { type: 'application/octet-stream' }));
     a.download = 'mode7craft.m7c'; document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
@@ -138,7 +142,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   fileIn.addEventListener('change', async () => { const f = fileIn.files[0]; fileIn.value = ''; if (f) importBytes(new Uint8Array(await f.arrayBuffer())); });
   // torches: nearest 32 to the player go to the uniform as point lights
   let lights = [], lightsT = 0;
-  const ub = dev.createBuffer({ label: 'uniforms', size: 352, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const ub = dev.createBuffer({ label: 'uniforms', size: 480, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const tb = dev.createBuffer({ label: 'uniforms', size: 512, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const bb = dev.createBuffer({ label: 'uniforms', size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   // render distance 'Sikt': far-plane scale, and the HQ sun-shadow cache window (WS x WS columns around the view)
@@ -150,24 +154,8 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const sc0 = dev.createBuffer({ label: 'shadowcache', size: 16, usage: GPUBufferUsage.STORAGE });
   let scb = null, WS = 0, wx = 0, wy = 0, bakedW = '';
   const scAlloc = () => {
-    const ws = hq ? SIKT[sikt].ws : 0; if (ws === WS) return; scb?.destroy(); scb = null; WS = ws; bakedW = ''; if (Q) Q.bg = Q.bgL = null;
+    const ws = hq ? SIKT[sikt].ws : 0; if (ws === WS) return; scb?.destroy(); scb = null; WS = ws; bakedW = ''; if (Q) Q.bg = null;
     if (ws) { scb = dev.createBuffer({ label: 'shadowcache', size: ws * ws * NZ / 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); dev.queue.writeBuffer(scb, 0, new Uint8Array(ws * ws * NZ / 4).fill(0xaa)); }
-  };
-  // per-splat lit colour (4 halfs), written once per frame by the 'slit' compute pass
-  const SPLATS = +qs.get('splats') || 24000;   // total splat cap
-  let spb = null;
-  // exposed leaf voxels for the HQ leaf splats: index | open-face mask << 20 (sides + top; rebuilt after world edits)
-  const MAXL = 16384, lfb = dev.createBuffer({ label: 'leaflist', size: MAXL * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-  let nLeaf = 0, leafDirty = true;
-  const leafList = () => {
-    const w = new Uint8Array(mem(), X.world_ptr(), N * N * NZ), a = new Uint32Array(MAXL), D = [1, -1, N, -N, N * N, -N * N]; nLeaf = 0;
-    for (let i = 0; i < N * N * NZ && nLeaf < MAXL; i++) {
-      if (w[i] !== 6) continue;
-      const x = i % N, y = (i / N | 0) % N, z = i / (N * N) | 0, ok = [x < N - 1, x > 0, y < N - 1, y > 0, z < NZ - 1, z > 0]; let m = 0;
-      for (let k = 0; k < 5; k++) if (ok[k] && (w[i + D[k]] === 0 || w[i + D[k]] === 8)) m |= 1 << k;
-      if (m) a[nLeaf++] = i | m << 20;
-    }
-    dev.queue.writeBuffer(lfb, 0, a); leafDirty = false;
   };
   let sunD = [0, 0, 1], bakedL = null, bakeDirty = true, bakes = 0;
   // v10.1: no pipeline-overridable `constants` at all. Safari/WebKit before mid-2026 silently drops every draw of a
@@ -181,7 +169,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     return mods.get(code);
   };
   // pipeline errors are caught per pipeline (validation + internal scopes); tag says what to switch off if it fails
-  let splatOff = false, hqOff = noFS, leafOff = false;
+  let hqOff = noFS, leafOff = false;
   const guard = (tag, mkp) => {
     dev.pushErrorScope('internal'); dev.pushErrorScope('validation');
     const p = mkp(); const chk = (er) => er && fallback(tag, er.message);
@@ -190,13 +178,13 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const mk = (code, f, e = 'fs', c, ds, v = 'vs', tag = 'base') => guard(tag, () => { const m = mod(spec(code, c)); return dev.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: v }, fragment: { module: m, entryPoint: e, targets: [{ format: f }] }, depthStencil: ds ? { format: 'depth32float', depthWriteEnabled: true, depthCompare: ds } : undefined }); });
   const blit = mk(BLIT_WGSL, fmt), scP = {};
   // scene pipelines per (HQ, porous leaves): LEAF is a baked constant, so 'Block' compiles the exact old code
-  const sceneP = (h, l) => scP[+h + 2 * l] ||= h ? mk(SCENE_WGSL, 'rgba16float', 'fsh', { HQ: 1, LEAF: l }, 'always', 'vs', 'hq') : mk(SCENE_WGSL, 'rgba8unorm', 'fs', { LEAF: l }, 0, 'vs', l ? 'leaf' : 'base');
+  const sceneP = (h, l) => scP[+h + 2 * l] ||= h ? mk(SCENE_WGSL, 'rgba16float', 'fs', { HQ: 1, LEAF: l }, 0, 'vs', 'hq') : mk(SCENE_WGSL, 'rgba8unorm', 'fs', { LEAF: l }, 0, 'vs', l ? 'leaf' : 'base');
   let SP;
   // HQ setting: same scene shader with the HQ override on (HDR target) + bloom + tonemap passes.
   // Built and allocated only when HQ is switched on; standard mode never touches any of it.
   const fxq = qs.get('fx'); let hq = !hqOff && (fxq ?? localStorage.getItem('m7c-fx') ?? '1') === '1';
   const tq = qs.get('tod'); let tod = tq != null ? (isNaN(+tq) ? tq : +tq) : localStorage.getItem('m7c-tod') || 'cyc', Q = null, bt, lt, bgB, bgO;
-  const hqP = () => Q ||= { bake: guard('hq', () => dev.createComputePipeline({ layout: 'auto', compute: { module: mod(spec(SCENE_WGSL)), entryPoint: 'bake' } })), splat: mk(SCENE_WGSL, 'rgba16float', 'sfs', { HQ: 1 }, 'less', 'svs', 'splat'), slit: guard('splat', () => dev.createComputePipeline({ layout: 'auto', compute: { module: mod(spec(SCENE_WGSL, { HQ: 1 })), entryPoint: 'slit' } })), bloom: mk(HQ_WGSL, 'rgba16float', 'fb', 0, 0, 'vs', 'hq'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo', 0, 0, 'vs', 'hq'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
+  const hqP = () => Q ||= { bake: guard('hq', () => dev.createComputePipeline({ layout: 'auto', compute: { module: mod(spec(SCENE_WGSL)), entryPoint: 'bake' } })), bloom: mk(HQ_WGSL, 'rgba16float', 'fb', 0, 0, 'vs', 'hq'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo', 0, 0, 'vs', 'hq'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
   const bgE = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map(([binding, resource]) => ({ binding, resource })) });
   const bgr = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map((resource, binding) => ({ binding, resource })) });
   // edges: 0 Pixel (classic), 1 Mjuka (edge-smoothing upscale), 2 Skarpa (near-native rays, art-size texels)
@@ -204,13 +192,13 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   // internal-pixel budget: Skarpa starts at 40% of its cap and dynamic resolution climbs while frames are fast
   const amax = () => edge === 2 ? (hq ? 500000 : 1000000) : hq ? 70000 : 115000;
   const area0 = () => edge === 2 ? amax() * 0.4 : amax();
-  let rt, dt, sgS, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = +qs.get("area") || area0(), cross = 0;
+  let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = +qs.get("area") || area0(), cross = 0;
   // ordered 4x4 Bayer dithering to a limited palette in the upscale: 'auto' = HQ only, '1' on, '0' off
   const dq = qs.get('dither'); let dith = dq ?? localStorage.getItem('m7c-dither') ?? '0';
-  // leaves: 0 Block (old solid), 1 Löv (porous leaf sprites), 2 Löv+splats (HQ: + swaying leaf splats); 'auto' = 2 in HQ, 1 in Standard
-  const lq = qs.get('leaf'); let leaf = lq ?? localStorage.getItem('m7c-leaf') ?? 'auto';
-  const leafM = () => { const m = leafOff ? 0 : leaf === 'auto' ? (hq ? 2 : 1) : +leaf || 0; return (hq && !splatOff && !noVS) || m < 2 ? m : 1; };
-  const splatK = () => Math.max(1, Math.min(8, Math.round(8 * AREA / (+qs.get('area') || area0())), Math.floor(SPLATS / Math.max(nLeaf, 1))));
+  // leaves: 0 Block (old solid), 1 Löv (porous cutout leaves, the default). v12: the HQ leaf splats are gone;
+  // old saved values ('auto', '2' = Löv+splats) mean Löv
+  const lq = qs.get('leaf'); let leaf = lq ?? localStorage.getItem('m7c-leaf') ?? '1';
+  const leafM = () => leafOff || leaf === '0' ? 0 : 1;
   const bset = () => dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, art, (edge === 1 ? 1 : 0) + (dith === '1' || (dith === 'auto' && hq) ? 2 : 0)]));
   const resize = () => {
     const d = Math.min(devicePixelRatio || 1, 3);
@@ -220,20 +208,13 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     // Skarpa: fractional scale (up to native, capped by the pixel budget); art = the classic pixel size in internal pixels
     if (edge === 2) { px = Math.max(1, Math.sqrt(W * H / AREA)); art = Math.max(1, Math.round(Math.sqrt(W * H / (hq ? 70000 : 115000)))) / px; } else art = 0;
     iw = Math.ceil(W / px); ih = Math.ceil(H / px);
-    rt?.destroy(); dt?.destroy(); bt?.destroy(); lt?.destroy(); bt = lt = dt = null;
+    rt?.destroy(); bt?.destroy(); lt?.destroy(); bt = lt = null;
     const u = T.RENDER_ATTACHMENT | T.TEXTURE_BINDING;
     rt = dev.createTexture({ label: 'scene', size: [iw, ih], format: hq ? 'rgba16float' : 'rgba8unorm', usage: u | T.COPY_SRC });   // COPY_SRC: black-frame probe
     if (hq) hqP(); scAlloc(); SP = sceneP(hq, +(leafM() > 0));
     sg = bgE(SP, [[0, { buffer: ub }], [1, vox.createView()], [2, hm.createView()], [3, { buffer: tb }], [4, { buffer: scb || sc0 }], [8, occT.createView()]]);
     if (hq) Q.bg ||= bgE(Q.bake, [[0, { buffer: ub }], [1, vox.createView()], [7, { buffer: scb }]]);
-    spb?.destroy(); spb = null;
     if (hq) {
-      dt = dev.createTexture({ label: 'depth', size: [iw, ih], format: 'depth32float', usage: T.RENDER_ATTACHMENT });
-      if (leafM() === 2) {
-        spb = dev.createBuffer({ label: 'splatcol', size: SPLATS * 8, usage: GPUBufferUsage.STORAGE });
-        Q.bgL = bgE(Q.slit, [[0, { buffer: ub }], [1, vox.createView()], [3, { buffer: tb }], [4, { buffer: scb }], [5, { buffer: lfb }], [8, occT.createView()], [9, { buffer: spb }]]);
-        sgS = bgE(Q.splat, [[0, { buffer: ub }], [5, { buffer: lfb }], [6, { buffer: spb }]]);
-      }
       bt = dev.createTexture({ label: 'bloom', size: [Math.ceil(iw / 4), Math.ceil(ih / 4)], format: 'rgba16float', usage: u });
       lt = dev.createTexture({ label: 'tonemap', size: [iw, ih], format: 'rgba8unorm', usage: u });
       bgB = bgr(Q.bloom, [rt.createView()]); bgO = bgr(Q.out, [rt.createView(), bt.createView(), Q.sm]);
@@ -318,12 +299,13 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const panel = $('#s'); let row = 0, aSel = 0;
   const opened = () => panel.classList.contains('on');
   const syncPanel = () => {
-    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge, dith, sikt, leaf: leafOff ? 0 : leaf === 'auto' ? (hq ? 2 : 1) : +leaf }[e.dataset.k])));
+    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge, dith, sikt, leaf: leafM() }[e.dataset.k])));
     panel.querySelectorAll('p').forEach((e, i) => e.classList.toggle('f', i === row));
-    panel.querySelectorAll('[data-a]').forEach((e, i) => e.classList.toggle('on', row === 6 && i === aSel));
+    panel.querySelectorAll('[data-a]').forEach((e) => e.classList.toggle('on', acts(row)[aSel] === e));
   };
-  const ACT = { exp: exportWorld, imp: () => fileIn.click(), shr: shareLink };
-  const runAct = () => ACT[panel.querySelectorAll('[data-a]')[aSel].dataset.a]();
+  const ACT = { exp: exportWorld, imp: () => fileIn.click(), shr: shareLink, inv: () => { togglePanel(); net.invite(); }, nam: () => { togglePanel(); askName('Byt namn'); }, lv: () => net.mp ? net.leave() : toast('Du spelar ensam') };
+  const rows = () => [...panel.querySelectorAll('p')], acts = (r) => [...(rows()[r]?.querySelectorAll('[data-a]') || [])];
+  const runAct = () => ACT[acts(row)[aSel].dataset.a]();
   const setOpt = (k, v) => {
     if (k === 'fx') { if (hq !== (v === '1' && !hqOff)) { hq = v === '1' && !hqOff; localStorage.setItem('m7c-fx', +hq); AREA = area0(); slow = fast = 0; ceil = 1e9; resize(); } }
     else if (k === 'leaf') { leaf = v; localStorage.setItem('m7c-leaf', v); resize(); }
@@ -338,13 +320,12 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const fallback = (tag, why) => setTimeout(() => {
     console.warn('fallback', tag, why);
     if (tag === 'black') tag = hq ? 'hq' : leafM() ? 'leaf' : edge ? 'edge' : 'base';
-    if (tag === 'splat' && !splatOff) splatOff = true;
-    else if (tag === 'hq' && !hqOff) { hqOff = true; hq = false; AREA = area0(); slow = fast = 0; ceil = 1e9; }
+    if (tag === 'hq' && !hqOff) { hqOff = true; hq = false; AREA = area0(); slow = fast = 0; ceil = 1e9; }
     else if (tag === 'leaf' && !leafOff) leafOff = true;
     else if (tag === 'edge' && edge) { edge = 0; AREA = area0(); slow = fast = 0; ceil = 1e9; }
     else if (tag === 'base') return fail('Grafiken kunde inte startas (WebGPU): ' + why);
     else return;
-    warn(`Grafik: ${{ splat: 'l\u00f6vsplats', hq: 'HQ', leaf: 'l\u00f6vm\u00f6nster', edge: 'skarpa kanter' }[tag]} fungerar inte h\u00e4r och st\u00e4ngdes av (${String(why).slice(0, 160)})`);
+    warn(`Grafik: ${{ hq: 'HQ', leaf: 'l\u00f6vm\u00f6nster', edge: 'skarpa kanter' }[tag]} fungerar inte h\u00e4r och st\u00e4ngdes av (${String(why).slice(0, 160)})`);
     resize(); syncPanel();
   });
   // black-frame probe, once per (HQ, leaves, edges) combination: reads 3 short rows of the scene target.
@@ -361,7 +342,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     try {
       await buf.mapAsync(GPUMapMode.READ); const a = h ? new Uint16Array(buf.getMappedRange()) : new Uint8Array(buf.getMappedRange()); let lit = 0;
       for (let j = 0; j < 3; j++) for (let i = 0; i < w; i++) { let v = 0; for (let c = 0; c < 3; c++) v |= a[(j * 512 + i * b) / (h ? 2 : 1) + c] & (h ? 0x7fff : 255); lit += !!v; }
-      // a real frame (sky, ground, even night) has colour almost everywhere; a few leaf splats over a black scene do not count
+      // a real frame (sky, ground, even night) has colour almost everywhere
       buf.unmap(); if (lit < w * 3 / 4 && key === [hq, leafM(), edge].join()) fallback('black', 'svart bild');
     } catch (e) { console.warn('probe', e); }
     buf.destroy();
@@ -369,19 +350,258 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   };
   const togglePanel = () => { if (panel.classList.toggle('on') && document.pointerLockElement) document.exitPointerLock(); syncPanel(); };
   const stepOpt = (dir) => {
-    if (row === 6) { aSel = (aSel + dir + 3) % 3; return syncPanel(); }
+    const a = acts(row).length; if (a) { aSel = (aSel + dir + a) % a; return syncPanel(); }
     const o = [...panel.querySelectorAll('p')[row].querySelectorAll('i')], i = o.findIndex((e) => e.classList.contains('on')), e = o[(i + dir + o.length) % o.length]; setOpt(e.dataset.k, e.dataset.v);
   };
-  const moveRow = (dir) => { row = (row + dir + 7) % 7; syncPanel(); };
-  const enter = () => (row === 6 ? runAct() : stepOpt(1));
-  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = ['fx', 'tod', 'edge', 'dith', 'leaf', 'sikt'].indexOf(d.k); setOpt(d.k, d.v); } if (d.a) { row = 6; aSel = Object.keys(ACT).indexOf(d.a); syncPanel(); ACT[d.a](); } });
+  const moveRow = (dir) => { const n = rows().length; row = (row + dir + n) % n; aSel = 0; syncPanel(); };
+  const enter = () => (acts(row).length ? runAct() : stepOpt(1));
+  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = ['fx', 'tod', 'edge', 'dith', 'leaf', 'sikt'].indexOf(d.k); setOpt(d.k, d.v); } if (d.a) { row = rows().indexOf(e.target.closest('p')); aSel = acts(row).indexOf(e.target); syncPanel(); ACT[d.a](); } });
   $('#g').addEventListener('click', togglePanel);
   for (const el of [panel, $('#g')]) el.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
   syncPanel();
 
+  // ---------- v12 multiplayer: WebRTC data channels, no server ----------
+  // Signalling is manual: the host's offer and the guest's answer travel as long links (#join= / #svar=) or
+  // QR codes (SDP, deflate-raw, base64url). STUN only. Host-authoritative world: guests send their edits to the
+  // host, who applies and rebroadcasts them; max 4 players (host + 3 guests, one RTCPeerConnection each).
+  // Channel 'r' (reliable, JSON): hi / w(orld chunks) / e(dits) / j(oin) / l(eave). Channel 'u' (unordered,
+  // no retransmits): player state at 15 Hz as 9 floats [id, x, y, z, fx, fy, walk phase, swing, seq].
+  const NAMEK = 'm7c-name', MAXG = 3, RTC = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }, RD = 120;
+  const net = { mp: null, id: 0, seq: 0, peers: new Map(), pend: new Map(), rp: new Map(), name: localStorage.getItem(NAMEK) || '', wr: 0, wb: null, wc: null };
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => '&#' + c.charCodeAt(0) + ';');
+  const clean = (n) => String(n || '').replace(/[^\p{L}\p{N} _.-]/gu, '').trim().slice(0, 16) || 'Spelare';
+  const gen = (n) => /[sxz]$/i.test(n) ? n : n + 's';
+  const encC = async (o) => b64(await zip(new TextEncoder().encode(JSON.stringify(o))));
+  const decC = async (s) => JSON.parse(new TextDecoder().decode(await zip(unb64(s), 1)));
+  // smaller links: drop TCP candidates and two attributes a data-channel-only session does not need
+  const slim = (sdp) => sdp.split('\r\n').filter((l) => !/^a=(extmap-allow-mixed|msid-semantic)|^a=candidate:.* tcp /i.test(l)).join('\r\n');
+  const gather = (pc) => new Promise((ok) => { if (pc.iceGatheringState === 'complete') return ok(); const t = setTimeout(ok, 5000); pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); ok(); } }); });
+  const mkPeer = () => {
+    const pc = new RTCPeerConnection(RTC), r = pc.createDataChannel('r', { negotiated: true, id: 0 }), u = pc.createDataChannel('u', { negotiated: true, id: 1, ordered: false, maxRetransmits: 0 });
+    u.binaryType = 'arraybuffer'; return { pc, r, u, id: -1, n: '?' };
+  };
+  const sendJ = (p, o) => { if (p?.r.readyState === 'open') p.r.send(JSON.stringify(o)); };
+  const bcast = (o, not) => { for (const p of net.peers.values()) if (p !== not) sendJ(p, o); };
+  const link = (k, c) => location.origin + location.pathname + '#' + k + '=' + c;
+  const clock = () => performance.now() / 1000 + t0;
+  // ---- QR code (byte mode, ECC L, versions 1-40, best of 8 masks) -> rows of booleans; no dependencies ----
+  const qr = (txt) => {
+    const data = [...new TextEncoder().encode(txt)];
+    const EC = [7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30];
+    const NB = [1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8, 8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25];
+    const raw = (v) => { let r = (16 * v + 128) * v + 64; if (v >= 2) { const a = (v / 7 | 0) + 2; r -= (25 * a - 10) * a - 55; if (v >= 7) r -= 36; } return r; };
+    let v = 1; while (v <= 40 && (raw(v) >> 3) - EC[v - 1] * NB[v - 1] < data.length + (v < 10 ? 2 : 3)) v++;
+    if (v > 40) return null;
+    const cap = (raw(v) >> 3) - EC[v - 1] * NB[v - 1], bits = [], put = (x, k) => { for (let i = k - 1; i >= 0; i--) bits.push(x >>> i & 1); };
+    put(4, 4); put(data.length, v < 10 ? 8 : 16); for (const b of data) put(b, 8);
+    put(0, Math.min(4, cap * 8 - bits.length)); put(0, (8 - bits.length % 8) % 8);
+    const cw = []; for (let i = 0; i < bits.length; i += 8) cw.push(parseInt(bits.slice(i, i + 8).join(''), 2));
+    for (let p = 0xec; cw.length < cap; p ^= 0xec ^ 0x11) cw.push(p);
+    const mul = (x, y) => { let z = 0; for (let i = 7; i >= 0; i--) { z = (z << 1) ^ ((z >>> 7) * 0x11d); z ^= ((y >>> i) & 1) * x; } return z; };
+    const ne = EC[v - 1], nb = NB[v - 1], dv = new Array(ne).fill(0); dv[ne - 1] = 1;
+    for (let i = 0, rt = 1; i < ne; i++, rt = mul(rt, 2)) for (let j = 0; j < ne; j++) { dv[j] = mul(dv[j], rt); if (j + 1 < ne) dv[j] ^= dv[j + 1]; }
+    const rs = (d) => { const r = new Array(ne).fill(0); for (const b of d) { const f = b ^ r.shift(); r.push(0); for (let i = 0; i < ne; i++) r[i] ^= mul(dv[i], f); } return r; };
+    const rc = raw(v) >> 3, ns = nb - rc % nb, sl = rc / nb | 0, bl = [];
+    for (let i = 0, k = 0; i < nb; i++) { const d = cw.slice(k, k += sl - ne + (i < ns ? 0 : 1)), e = rs(d); if (i < ns) d.push(0); bl.push(d.concat(e)); }
+    const all = []; for (let i = 0; i < bl[0].length; i++) for (let j = 0; j < nb; j++) if (i !== sl - ne || j >= ns) all.push(bl[j][i]);
+    const n = v * 4 + 17, M = [], F = [];
+    for (let i = 0; i < n; i++) { M.push(new Array(n).fill(false)); F.push(new Array(n).fill(false)); }
+    const set = (x, y, d) => { M[y][x] = !!d; F[y][x] = true; };
+    for (let i = 0; i < n; i++) { set(6, i, i % 2 === 0); set(i, 6, i % 2 === 0); }
+    for (const [cx, cy] of [[3, 3], [n - 4, 3], [3, n - 4]]) for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) { const d = Math.max(Math.abs(dx), Math.abs(dy)), x = cx + dx, y = cy + dy; if (x >= 0 && x < n && y >= 0 && y < n) set(x, y, d !== 2 && d !== 4); }
+    if (v > 1) {
+      const na = (v / 7 | 0) + 2, step = v === 32 ? 26 : Math.ceil((v * 4 + 4) / (na * 2 - 2)) * 2, ap = [6]; for (let p = n - 7; ap.length < na; p -= step) ap.splice(1, 0, p);
+      for (let i = 0; i < na; i++) for (let j = 0; j < na; j++) if (!(i === 0 && j === 0 || i === 0 && j === na - 1 || i === na - 1 && j === 0)) for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) set(ap[i] + dx, ap[j] + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+    }
+    const fmt = (m) => {
+      const d = 1 << 3 | m; let r = d; for (let i = 0; i < 10; i++) r = (r << 1) ^ ((r >>> 9) * 0x537); const b = (d << 10 | r) ^ 0x5412, g = (i) => b >>> i & 1;
+      for (let i = 0; i <= 5; i++) set(8, i, g(i)); set(8, 7, g(6)); set(8, 8, g(7)); set(7, 8, g(8)); for (let i = 9; i < 15; i++) set(14 - i, 8, g(i));
+      for (let i = 0; i < 8; i++) set(n - 1 - i, 8, g(i)); for (let i = 8; i < 15; i++) set(8, n - 15 + i, g(i)); set(8, n - 8, 1);
+    };
+    fmt(0);
+    if (v >= 7) { let r = v; for (let i = 0; i < 12; i++) r = (r << 1) ^ ((r >>> 11) * 0x1f25); const b = v << 12 | r; for (let i = 0; i < 18; i++) { const t = b >>> i & 1, a = n - 11 + i % 3, c = i / 3 | 0; set(a, c, t); set(c, a, t); } }
+    for (let i = 0, r = n - 1; r >= 1; r -= 2) { if (r === 6) r = 5; for (let vt = 0; vt < n; vt++) for (let j = 0; j < 2; j++) { const x = r - j, y = (r + 1 & 2) === 0 ? n - 1 - vt : vt; if (!F[y][x] && i < all.length * 8) { M[y][x] = (all[i >>> 3] >>> 7 - (i & 7) & 1) === 1; i++; } } }
+    const MK = [(x, y) => (x + y) % 2, (x, y) => y % 2, (x) => x % 3, (x, y) => (x + y) % 3, (x, y) => ((x / 3 | 0) + (y / 2 | 0)) % 2, (x, y) => x * y % 2 + x * y % 3, (x, y) => (x * y % 2 + x * y % 3) % 2, (x, y) => ((x + y) % 2 + x * y % 3) % 2];
+    const msk = (m) => { for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) if (!F[y][x] && !MK[m](x, y)) M[y][x] = !M[y][x]; };
+    const pen = () => {
+      let p = 0, dk = 0;
+      for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) { dk += M[y][x]; if (x < n - 1 && y < n - 1 && M[y][x] === M[y][x + 1] && M[y][x] === M[y + 1][x] && M[y][x] === M[y + 1][x + 1]) p += 3; }
+      for (let a = 0; a < n; a++) { let rx = 1, ry = 1; for (let b = 1; b < n; b++) { if (M[a][b] === M[a][b - 1]) { if (++rx === 5) p += 3; else if (rx > 5) p++; } else rx = 1; if (M[b][a] === M[b - 1][a]) { if (++ry === 5) p += 3; else if (ry > 5) p++; } else ry = 1; } }
+      return p + (Math.ceil(Math.abs(dk * 20 - n * n * 10) / (n * n)) - 1) * 10;
+    };
+    let best = 0, bp = 1e9; for (let m = 0; m < 8; m++) { msk(m); fmt(m); const p = pen(); if (p < bp) { bp = p; best = m; } msk(m); }
+    msk(best); fmt(best); return M;
+  };
+  const drawQR = (c, txt) => {
+    const M = qr(txt); if (!M) return c.remove(); const n = M.length, s = Math.max(2, Math.floor(Math.min(340, innerWidth * 0.82, innerHeight * 0.5) / (n + 8)));
+    c.width = c.height = (n + 8) * s; const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.width); g.fillStyle = '#000';
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) if (M[y][x]) g.fillRect((x + 4) * s, (y + 4) * s, s, s);
+  };
+  // ---- sheet: the small dialog for names, links and QR codes ----
+  const shEl = $('#n'); let shFn = {};
+  const sheet = (html, fn = {}) => { shEl.innerHTML = html; shFn = fn; shEl.classList.add('on'); if (document.pointerLockElement) document.exitPointerLock(); };
+  const closeSheet = () => { shEl.classList.remove('on'); shFn = {}; };
+  shEl.addEventListener('click', (e) => { const k = e.target.dataset?.n; if (k && shFn[k]) shFn[k](); else if (k === 'x') closeSheet(); });
+  shEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && shFn.ok) shFn.ok(); if (e.key === 'Escape') closeSheet(); e.stopPropagation(); });
+  for (const ev of ['touchstart', 'touchmove', 'pointerdown', 'wheel', 'keyup']) shEl.addEventListener(ev, (e) => e.stopPropagation(), { passive: true });
+  const setName = (n) => { net.name = clean(n); localStorage.setItem(NAMEK, net.name); };
+  const nameIn = () => `<input id="nn" maxlength="16" autocomplete="nickname" placeholder="Anv\u00e4ndarnamn" value="${esc(net.name)}">`;
+  const askName = (title) => new Promise((ok) => {
+    sheet(`<b>${title}</b><p>Ditt namn syns ovanf\u00f6r din gubbe.</p>${nameIn()}<div><i data-n="ok">OK</i><i data-n="no">Avbryt</i></div>`,
+      { ok: () => { setName($('#nn').value); closeSheet(); ok(true); }, no: () => { closeSheet(); ok(false); } });
+    setTimeout(() => $('#nn')?.focus(), 50);
+  });
+  const copy = async (url) => { try { await navigator.clipboard.writeText(url); toast('L\u00e4nk kopierad'); } catch { $('#nl')?.select(); } };
+  const shareL = async (url) => { try { await navigator.share({ title: 'Mode7craft', url }); } catch { copy(url); } };
+  const showLink = (title, text, url, host) => {
+    sheet(`<b>${esc(title)}</b><p>${esc(text)}</p><canvas id="nq"></canvas><textarea id="nl" readonly rows="3">${esc(url)}</textarea><div><i data-n="cp">Kopiera</i>${navigator.share ? '<i data-n="sh">Dela</i>' : ''}<i data-n="x">St\u00e4ng</i></div>` +
+      (host ? `<p>Klistra in v\u00e4nnens svarsl\u00e4nk:</p><input id="na" placeholder="https://\u2026#svar=\u2026"><div><i data-n="ok">Anslut</i></div>` : '<p class="w">V\u00e4ntar p\u00e5 anslutning\u2026</p>'),
+      { cp: () => copy(url), sh: () => shareL(url), ok: host ? () => answer($('#na').value) : undefined });
+    drawQR($('#nq'), url);
+  };
+  // ---- connection lifecycle ----
+  const wire = (p, key) => {
+    p.r.onopen = () => onOpen(p, key);
+    p.r.onmessage = (e) => { try { onMsg(p, JSON.parse(e.data)); } catch (er) { console.warn('net', er); } };
+    p.u.onmessage = (e) => onState(p, new Float32Array(e.data));
+    p.r.onclose = () => drop(p);
+    p.pc.onconnectionstatechange = () => { if (/failed|closed/.test(p.pc.connectionState)) drop(p); };
+  };
+  // host: 'Bjud in' -> a fresh peer connection + offer link; one per guest
+  const invite = async () => {
+    if (net.mp === 'guest') return toast('Bara v\u00e4rden kan bjuda in'), '';
+    if (net.peers.size >= MAXG) return toast('Fullt: max 4 spelare'), '';
+    if (!net.name && !await askName('Bjud in en v\u00e4n')) return '';
+    const p = mkPeer(), i = Math.random().toString(36).slice(2, 8);
+    for (const [k, q] of net.pend) if (net.pend.size >= 4) { q.pc.close(); net.pend.delete(k); }   // forget stale invites
+    net.pend.set(i, p); wire(p, i);
+    sheet('<b>Bjud in</b><p>Skapar inbjudan\u2026</p>');
+    await p.pc.setLocalDescription(await p.pc.createOffer()); await gather(p.pc);
+    const url = link('join', await encC({ i, n: net.name, s: slim(p.pc.localDescription.sdp) }));
+    showLink('Bjud in en v\u00e4n', 'Skicka l\u00e4nken till din v\u00e4n (eller l\u00e5t hen skanna QR-koden). V\u00e4nnen f\u00e5r d\u00e5 en svarsl\u00e4nk att skicka tillbaka \u2013 \u00f6ppna den i den h\u00e4r webbl\u00e4saren eller klistra in den nedan.', url, true);
+    return url;
+  };
+  const answer = async (s) => {
+    const m = String(s).match(/svar=([\w-]+)/); let a;
+    try { a = await decC(m ? m[1] : String(s).trim()); } catch { toast('Ogiltigt svar'); return 0; }
+    const p = net.pend.get(a.i); if (!p || p.pc.signalingState !== 'have-local-offer') { toast('Svaret h\u00f6r inte till n\u00e5gon \u00f6ppen inbjudan'); return 0; }
+    p.n = clean(a.n); await p.pc.setRemoteDescription({ type: 'answer', sdp: a.s });
+    sheet(`<b>Ansluter</b><p>Ansluter till ${esc(p.n)}\u2026</p><div><i data-n="x">St\u00e4ng</i></div>`); return 1;
+  };
+  // guest: opened a #join link -> name -> answer link back to the host
+  const accept = async (o, name) => {
+    if (name != null) setName(name);
+    if (net.mp) leave();
+    const p = mkPeer(); p.id = 0; p.n = clean(o.n); net.id = -1; net.pend.set('host', p); wire(p, 'host');
+    sheet('<b>G\u00e5 med</b><p>Skapar svar\u2026</p>');
+    await p.pc.setRemoteDescription({ type: 'offer', sdp: o.s }); await p.pc.setLocalDescription(await p.pc.createAnswer()); await gather(p.pc);
+    const url = link('svar', await encC({ i: o.i, n: net.name, s: slim(p.pc.localDescription.sdp) }));
+    if (p.r.readyState !== 'open') showLink(`G\u00e5 med i ${gen(p.n)} v\u00e4rld`, `Skicka den h\u00e4r svarsl\u00e4nken (eller QR-koden) tillbaka till ${p.n}. N\u00e4r ${p.n} \u00f6ppnar den kopplas ni ihop.`, url);
+    return url;
+  };
+  const askJoin = async (code) => {
+    let o; try { o = await decC(code); } catch { return toast('Ogiltig inbjudan'); }
+    sheet(`<b>G\u00e5 med i ${esc(gen(clean(o.n)))} v\u00e4rld</b><p>V\u00e4lj ett anv\u00e4ndarnamn:</p>${nameIn()}<div><i data-n="ok">G\u00e5 med</i><i data-n="x">Spela ensam</i></div>`, { ok: () => accept(o, $('#nn').value) });
+    setTimeout(() => $('#nn')?.focus(), 50);
+  };
+  const onOpen = (p, key) => {
+    net.pend.delete(key);
+    if (key === 'host') { closeSheet(); net.mp = 'guest'; net.peers.set(0, p); addRP(0, p.n); toast(`Ansluten till ${p.n}`); return; }
+    if (net.peers.size >= MAXG) { sendJ(p, { t: 'full' }); setTimeout(() => p.pc.close(), 500); return; }
+    let id = 1; while (net.peers.has(id)) id++; p.id = id; net.mp = 'host'; closeSheet();
+    sendJ(p, { t: 'hi', id, p: [[0, net.name || 'V\u00e4rd'], ...[...net.peers.values()].map((q) => [q.id, q.n])], tm: clock(), x: [st[0], st[1], st[2]] });
+    bcast({ t: 'j', id, n: p.n }); net.peers.set(id, p); addRP(id, p.n);
+    sendWorld(p); toast(`${p.n} gick med`);
+  };
+  const sendWorld = async (p) => { const s = b64(await pack()), C = 16000, n = Math.ceil(s.length / C); for (let k = 0; k < n; k++) sendJ(p, { t: 'w', k, n, d: s.slice(k * C, k * C + C) }); };
+  const applyE = (b) => { for (const [x, y, z, id] of b) if (X.set_block(x, y, z, id)) touch1(x, y, z, id, 1); };
+  const okE = (b) => Array.isArray(b) ? b.filter((e) => Array.isArray(e) && e.length === 4 && e.every(Number.isInteger) && e[3] >= 0 && e[3] <= 8 && (e[3] || e[2] > 0)).slice(0, 64) : [];
+  const onMsg = async (p, m) => {
+    if (net.mp === 'host') { if (m.t === 'e') { const b = okE(m.b); if (b.length) { applyE(b); bcast({ t: 'e', b }); } } return; }
+    if (m.t === 'hi') { net.id = m.id; for (const [id, n] of m.p) if (id !== m.id) addRP(id, n); t0 = m.tm - performance.now() / 1000; net.hx = m.x; }
+    else if (m.t === 'w') {
+      (net.wc ||= [])[m.k] = m.d; if (net.wc.filter((x) => x != null).length < m.n) return;
+      const s = net.wc.join(''); net.wc = null; const w = await unpack(unb64(s));
+      saveNow(); noSave = true; loadWorld(w); net.wr = 1; applyE(net.wb || []); net.wb = null;
+      if (net.hx) { const [x, y, z] = net.hx, nx = Math.min(N - 2, Math.max(1, x + 1.5)) | 0, ny = Math.min(N - 2, Math.max(1, y)) | 0; st[0] = nx + 0.5; st[1] = ny + 0.5; st[2] = Math.max(H8()[ny * N + nx], z); cz = st[2]; }
+    }
+    else if (m.t === 'e') { const b = okE(m.b); if (net.wr) applyE(b); else (net.wb ||= []).push(...b); }
+    else if (m.t === 'j') { addRP(m.id, m.n); toast(`${clean(m.n)} gick med`); }
+    else if (m.t === 'l') { const r = net.rp.get(m.id); if (r) toast(`${r.n} l\u00e4mnade`); delRP(m.id); }
+    else if (m.t === 'full') toast('V\u00e4rlden \u00e4r full (max 4 spelare)');
+  };
+  const onState = (p, f) => {
+    if (f.length !== 9) return;
+    if (net.mp === 'host') { f[0] = p.id; for (const q of net.peers.values()) if (q !== p && q.u.readyState === 'open') q.u.send(f); }
+    const r = net.rp.get(f[0]); if (!r || f[0] === net.id || f[8] <= r.seq) return;
+    r.seq = f[8]; r.q.push([performance.now(), f.slice(1, 8)]); if (r.q.length > 10) r.q.shift();
+  };
+  const drop = (p) => {
+    if (p.gone) return; p.gone = 1; try { p.pc.close(); } catch {}
+    for (const [k, q] of net.pend) if (q === p) { net.pend.delete(k); if (shEl.textContent.includes('Ansluter') || k === 'host') { closeSheet(); toast(`Kunde inte ansluta till ${p.n}`); } }
+    if (net.mp === 'host' && net.peers.get(p.id) === p) { net.peers.delete(p.id); delRP(p.id); bcast({ t: 'l', id: p.id }); toast(`${p.n} l\u00e4mnade`); if (!net.peers.size) net.mp = null; }
+    else if (net.mp === 'guest' && p.id === 0) leave(`Anslutningen till ${p.n} br\u00f6ts \u2013 din egen v\u00e4rld \u00e4r tillbaka`);
+  };
+  const leave = (msg) => {
+    const g = net.mp === 'guest';
+    for (const p of [...net.peers.values(), ...net.pend.values()]) { p.gone = 1; try { p.pc.close(); } catch {} }
+    net.peers.clear(); net.pend.clear(); for (const id of [...net.rp.keys()]) delRP(id);
+    net.mp = null; net.id = 0; net.wr = 0; net.wb = net.wc = null;
+    if (g || noSave) { noSave = false; loadWorld(parseEd(localStorage.getItem(KEY))); }
+    if (msg !== 0) toast(msg || 'Du l\u00e4mnade spelet');
+  };
+  netEd = (x, y, z, id) => { const m = { t: 'e', b: [[x, y, z, id]] }; if (net.mp === 'host') bcast(m); else if (net.mp === 'guest' && net.wr) sendJ(net.peers.get(0), m); };
+  // the answer link opened in another tab of the same browser reaches the host tab here
+  const bc = typeof BroadcastChannel == 'function' ? new BroadcastChannel('m7c-net') : null;
+  if (bc) bc.onmessage = async (e) => { if (!e.data?.svar) return; let a; try { a = await decC(e.data.svar); } catch { return; } if (net.pend.has(a.i)) { bc.postMessage({ ack: a.i }); answer(e.data.svar); } };
+  const onHash = async () => {
+    const h = location.hash.match(/^#(join|svar)=([\w-]+)/); if (!h) return 0;
+    history.replaceState(null, '', location.pathname + location.search);
+    if (h[1] === 'join') return askJoin(h[2]), 1;
+    try { const a = await decC(h[2]); if (net.pend.has(a.i)) return answer(h[2]), 1; } catch { return toast('Ogiltig l\u00e4nk'), 1; }
+    // not this tab's invite: hand it to the tab that made it
+    sheet('<b>Svarsl\u00e4nk</b><p>Skickar svaret till fliken d\u00e4r du bj\u00f6d in\u2026</p>');
+    const done = (ok) => { clearTimeout(to); bc?.removeEventListener('message', w); sheet(ok ? '<b>Klart!</b><p>Svaret skickades till fliken d\u00e4r du bj\u00f6d in. Du kan st\u00e4nga den h\u00e4r fliken.</p><div><i data-n="x">OK</i></div>' : '<b>Svarsl\u00e4nk</b><p>Hittade ingen \u00f6ppen inbjudan i den h\u00e4r webbl\u00e4saren. \u00d6ppna l\u00e4nken i webbl\u00e4saren d\u00e4r du klickade Bjud in, eller klistra in den d\u00e4r.</p><div><i data-n="x">OK</i></div>'); };
+    const w = (e) => { if (e.data?.ack) done(1); }, to = setTimeout(() => done(0), 5000); bc?.addEventListener('message', w); bc?.postMessage({ svar: h[2] });
+    return 1;
+  };
+  addEventListener('hashchange', onHash);
+  // ---- remote players: interpolated ~RD ms behind, drawn by the shader (U[21].y, U[22..29]); DOM nametags ----
+  const mkTag = (n) => {
+    const c = document.createElement('canvas'), g = c.getContext('2d'), F = '10px ui-monospace,Menlo,monospace'; c.className = 'nt';
+    g.font = F; const w = Math.ceil(g.measureText(n).width) + 4; c.width = w; c.height = 13; g.font = F; g.textBaseline = 'top'; g.fillStyle = '#fff'; g.fillText(n, 2, 2);
+    // hard-edged pixel text: threshold the antialiased glyphs, plate = translucent black (early-Minecraft nametag)
+    const d = g.getImageData(0, 0, w, 13), a = d.data; for (let i = 0; i < a.length; i += 4) { const on = a[i + 3] > 96; a[i] = a[i + 1] = a[i + 2] = on ? 255 : 0; a[i + 3] = on ? 255 : 110; }
+    g.putImageData(d, 0, 0); return c;
+  };
+  const addRP = (id, n) => { if (net.rp.has(id)) return; const tag = mkTag(clean(n)); document.body.append(tag); net.rp.set(id, { n: clean(n), q: [], tag, seq: 0 }); };
+  const delRP = (id) => { const r = net.rp.get(id); if (r) { r.tag.remove(); net.rp.delete(id); } };
+  // own state at 15 Hz on a timer (keeps going even when the frame rate drops)
+  setInterval(() => { if (!net.mp) return; const f = new Float32Array([net.id, st[0], st[1], st[2], st[4], st[5], st[6], st[7], ++net.seq]); for (const q of net.peers.values()) if (q.u.readyState === 'open') try { q.u.send(f); } catch {} }, 1000 / 15);
+  const netFrame = (far) => {
+    if (!net.mp) return;
+    const tn = performance.now() - RD; let k = 0;
+    for (const [id, r] of net.rp) {
+      const q = r.q; if (!q.length || k >= 4) { r.tag.style.display = 'none'; continue; }
+      let i = 0; while (i < q.length - 1 && q[i + 1][0] <= tn) i++;
+      const a = q[i][1], b = (q[i + 1] || q[i])[1], t = q[i + 1] ? Math.min(1, Math.max(0, (tn - q[i][0]) / (q[i + 1][0] - q[i][0]))) : 0, L = (j) => a[j] + (b[j] - a[j]) * t;
+      const fx = L(3), fy = L(4), fl = Math.hypot(fx, fy) || 1, dp = Math.atan2(Math.sin(b[5] - a[5]), Math.cos(b[5] - a[5])), p = [L(0), L(1), L(2)];
+      U.set([...p, id % 4, fx / fl, fy / fl, a[5] + dp * t, L(6)], 88 + k * 8); k++;
+      // nametag: project the point above the head to the screen (same camera model as screenRay)
+      const d = [p[0] - cam.o[0], p[1] - cam.o[1], p[2] + 2.25 - cam.o[2]], z = d[0] * cam.F[0] + d[1] * cam.F[1] + d[2] * cam.F[2];
+      if (z < 0.5 || z > far) { r.tag.style.display = 'none'; continue; }
+      const ax = iw / ih, ux = (d[0] * cam.R[0] + d[1] * cam.R[1] + d[2] * cam.R[2]) / z / (ax * cam.tan), uy = -(d[0] * cam.Up[0] + d[1] * cam.Up[1] + d[2] * cam.Up[2]) / z / cam.tan;
+      const s = Math.min(4, Math.max(1, Math.round(innerHeight / (cam.tan * z) * 0.5 / 13 * 2) / 2)), w = r.tag.width * s;
+      r.tag.style.cssText = `display:block;width:${w}px;height:${13 * s}px;transform:translate(${Math.round((ux + 1) / 2 * innerWidth - w / 2)}px,${Math.round((uy + 1) / 2 * innerHeight - 13 * s)}px)`;
+    }
+    U[85] = k;
+  };
+  net.invite = invite; net.answer = answer; net.accept = async (code, name) => accept(await decC(String(code).replace(/^.*join=/, '')), name); net.leave = leave;
+
   // ---------- keyboard + mouse ----------
   let jumpQ = false;
   addEventListener('keydown', (e) => {
+    if (e.target.closest?.('#n')) return;   // typing in the multiplayer dialog
     setMode('kb');
     if (e.code === 'KeyG' && !e.repeat) return togglePanel();
     if (opened()) {
@@ -482,12 +702,12 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const dz = (v) => (Math.abs(v) < 0.15 ? 0 : (v - Math.sign(v) * 0.15) / 0.85);
 
   // ---------- frame ----------
-  const U = new Float32Array(88), TLB = new Float32Array(128);
+  const U = new Float32Array(120), TLB = new Float32Array(128);
   let last = performance.now(), acc = 0, frames = 0, slow = 0, fast = 0, ceil = 1e9, warm = 0; const fixedArea = qs.has('area');
   // debug: ?p=x,y teleport, ?t=seconds time offset, ?pt=pitch
   if (qs.get('p')) { const [x, y] = qs.get('p').split(',').map(Number); const hm8 = H8(); st[0] = x + 0.5; st[1] = y + 0.5; st[2] = hm8[y * N + x] + 2; }
   if (qs.get('pt')) pitch = +qs.get('pt');
-  const t0 = +qs.get('t') || 0;
+  let t0 = +qs.get('t') || 0;
   // HQ sun: 'day' = the classic fixed sun; 'eve' = golden hour; 'cyc' = 4 min day/night; ?tod=hours
   const sm = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
   const sun = (time) => {
@@ -511,17 +731,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
       const c = enc.beginComputePass(); c.setPipeline(Q.bake); c.setBindGroup(0, Q.bg); c.dispatchWorkgroups(WS * WS * NZ / 1024); c.end();
       bakedL = sunD; bakedW = wx + ',' + wy; bakeDirty = false; bakes++;
     }
-    if (hq && leafDirty) leafList();
-    const nSpl = hq && leafM() === 2 && nLeaf ? Math.min(SPLATS, nLeaf * splatK()) : 0;
-    if (nSpl) { U[85] = nSpl; dev.queue.writeBuffer(ub, 85 * 4, U, 85, 1); const c = enc.beginComputePass(); c.setPipeline(Q.slit); c.setBindGroup(0, Q.bgL); c.dispatchWorkgroups(Math.ceil(nSpl / 64)); c.end(); }
-    if (hq) {
-      // HQ scene writes depth; leaf splats (Löv+splats) are depth-tested against it in the same pass
-      if (leafDirty) leafList();
-      const p = enc.beginRenderPass({ colorAttachments: [{ view: rt.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }], depthStencilAttachment: { view: dt.createView(), depthLoadOp: 'clear', depthClearValue: 1, depthStoreOp: 'discard' } });
-      p.setPipeline(SP); p.setBindGroup(0, sg); p.draw(3);
-      if (nSpl) { p.setPipeline(Q.splat); p.setBindGroup(0, sgS); p.draw(6, nSpl); }
-      p.end();
-    } else pass(enc, rt, SP, sg);
+    pass(enc, rt, SP, sg);
     if (hq) { pass(enc, bt, Q.bloom, bgB); pass(enc, lt, Q.out, bgO); }
     pass(enc, ctx.getCurrentTexture(), blit, bg);
     dev.queue.submit([enc.finish()]); drawn = rt;
@@ -587,9 +797,10 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     for (const q of parts) { q.life -= dt; q.v[2] -= 18 * dt; for (let k = 0; k < 3; k++) q.p[k] += q.v[k] * dt; }
     while (parts.length && parts[parts.length - 1].life <= 0) parts.pop();
     U.fill(0);
-    U.set([iw, ih, now / 1000 + t0, tanV, ...cam.o, V.fog, ...F, far, ...R, iw / ih, ...Up, leafM(), st[0], st[1], st[2], nLeaf, st[4], st[5], st[6], st[7], V.fps ? 1 : 0, 0, 0, 0]);
+    U.set([iw, ih, now / 1000 + t0, tanV, ...cam.o, V.fog, ...F, far, ...R, iw / ih, ...Up, leafM(), st[0], st[1], st[2], 0, st[4], st[5], st[6], st[7], V.fps ? 1 : 0, 0, 0, 0]);
     U.set([tH, wx, wy, WS, FOGS], 80);   // edge fog over the last 45% of the view distance (?fogs = start fraction, 0.35 = v10)
     if (hl) U.set([...hl.b, 1], 32);
+    netFrame(far);
     U[39] = edge === 1 ? -1 : art;
     if (hq) { const [d, c, sky, w] = sun(now / 1000 + t0); U.set(sky, 29); U.set([...d, 0, ...c, w], 72); sunD = d; }
     // torch lights: re-pick the nearest 32 every ~0.3 s (or after an edit), flicker per frame
@@ -617,10 +828,11 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
       acc = 0; frames = 0;
     }
   };
-  window.m7 = { act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; }, get area() { return AREA; }, get splats() { return leafM() === 2 ? nLeaf * splatK() : 0; }, get leaves() { return nLeaf; }, get sikt() { return sikt; }, get migrated() { return migrated; }, gpuMem: () => { const o = {}; let t = 0; for (const [k, b] of gmem.values()) { o[k] = (o[k] || 0) + b; t += b; } const sw = W * H * 4 * 3; return { total: t, swapchain3: sw, all: t + sw, ...o }; } }; // handy for tests
+  window.m7 = { net, act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; }, get area() { return AREA; }, get sikt() { return sikt; }, get migrated() { return migrated; }, gpuMem: () => { const o = {}; let t = 0; for (const [k, b] of gmem.values()) { o[k] = (o[k] || 0) + b; t += b; } const sw = W * H * 4 * 3; return { total: t, swapchain3: sw, all: t + sw, ...o }; } }; // handy for tests
   // shared world link (#w=...): load it, then drop the hash so later local edits stay local
   const hw = location.hash.match(/^#w=([\w-]+)/);
   if (hw) { history.replaceState(null, '', location.pathname + location.search); try { await importBytes(unb64(hw[1])); } catch { toast('Ogiltig l\u00e4nk'); } }
+  await onHash();   // #join= (a friend's invite) / #svar= (an answer to one of your invites)
   $('#l').remove();
   requestAnimationFrame(frame);
 })().catch((e) => fail('Failed to start: ' + e.message));
