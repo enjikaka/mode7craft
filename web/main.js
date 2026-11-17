@@ -36,7 +36,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const touch1 = (x, y, z, id) => {
     dev.queue.writeTexture({ texture: vox, origin: [x, y, z] }, new Uint8Array([id]), {}, [1, 1, 1]);
     dev.queue.writeTexture({ texture: hm, origin: [x, y] }, new Uint8Array(mem(), X.height_ptr() + y * N + x, 1), {}, [1, 1]);
-    edits.set((z * N + y) * N + x, id); save(); lightsT = 0; bakeDirty = true;
+    edits.set((z * N + y) * N + x, id); save(); lightsT = 0; bakeDirty = leafDirty = true;
   };
   // ---------- world files: 'M7C' + version 1 + flags (1 = deflate-raw) + 3 bytes per edit:
   // (index delta << 4 | id), indices sorted. Same bytes go base64url into share links (#w=...).
@@ -64,7 +64,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     for (const [i, id] of m) { edits.set(i, id); X.set_block(i % N, (i / N | 0) % N, i / (N * N) | 0, id); }
     dev.queue.writeTexture({ texture: vox }, new Uint8Array(mem(), X.world_ptr(), N * N * NZ), { bytesPerRow: N, rowsPerImage: N }, [N, N, NZ]);
     dev.queue.writeTexture({ texture: hm }, new Uint8Array(mem(), X.height_ptr(), N * N), { bytesPerRow: N }, [N, N]);
-    save(); lightsT = 0; cz = st[2]; bakeDirty = true;
+    save(); lightsT = 0; cz = st[2]; bakeDirty = leafDirty = true;
   };
   const ask = (m) => !edits.size || confirm(`Ers\u00e4tt din v\u00e4rld med den importerade (${m.size} \u00e4ndringar)?`);
   const toast = (m) => { hint.textContent = m; clearTimeout(toast.t); toast.t = setTimeout(setHint, 3500); };
@@ -88,25 +88,47 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const tb = dev.createBuffer({ size: 512, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const bb = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   // HQ sun-shadow cache (1 byte per block cell, 128 = unknown -> per-pixel rays until the first bake)
-  const scb = dev.createBuffer({ size: N * N * NZ, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const scb = dev.createBuffer({ size: N * N * NZ, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  const scb2 = dev.createBuffer({ size: N * N * NZ, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });   // copy for the splat pass
   dev.queue.writeBuffer(scb, 0, new Uint8Array(N * N * NZ).fill(128));
+  // exposed leaf voxels for the HQ leaf splats: index | open-face mask << 18 (sides + top; rebuilt after world edits)
+  const MAXL = 6000, lfb = dev.createBuffer({ size: MAXL * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  let nLeaf = 0, leafDirty = true;
+  const leafList = () => {
+    const w = new Uint8Array(mem(), X.world_ptr(), N * N * NZ), a = new Uint32Array(MAXL), D = [1, -1, N, -N, N * N, -N * N]; nLeaf = 0;
+    for (let i = 0; i < N * N * NZ && nLeaf < MAXL; i++) {
+      if (w[i] !== 6) continue;
+      const x = i % N, y = (i / N | 0) % N, z = i / (N * N) | 0, ok = [x < N - 1, x > 0, y < N - 1, y > 0, z < NZ - 1, z > 0]; let m = 0;
+      for (let k = 0; k < 5; k++) if (ok[k] && (w[i + D[k]] === 0 || w[i + D[k]] === 8)) m |= 1 << k;
+      if (m) a[nLeaf++] = i | m << 18;
+    }
+    dev.queue.writeBuffer(lfb, 0, a); leafDirty = false;
+  };
   let sunD = [0, 0, 1], bakedL = null, bakeDirty = true, bakes = 0;
-  const mk = (code, f, e = 'fs', c) => { const m = dev.createShaderModule({ code }); m.getCompilationInfo?.().then((i) => i.messages.forEach((x) => console.warn(x.type, x.lineNum, x.message))); return dev.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: e, constants: c, targets: [{ format: f }] } }); };
-  const scene = mk(SCENE_WGSL, 'rgba8unorm'), blit = mk(BLIT_WGSL, fmt);
+  const mk = (code, f, e = 'fs', c, ds, v = 'vs') => { const m = dev.createShaderModule({ code }); m.getCompilationInfo?.().then((i) => i.messages.forEach((x) => console.warn(x.type, x.lineNum, x.message))); return dev.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: v, constants: c }, fragment: { module: m, entryPoint: e, constants: c, targets: [{ format: f }] }, depthStencil: ds && { format: 'depth32float', depthWriteEnabled: true, depthCompare: ds } }); };
+  const blit = mk(BLIT_WGSL, fmt), scP = {};
+  // scene pipelines per (HQ, porous leaves): LEAF is a pipeline constant, so 'Block' compiles the exact old code
+  const sceneP = (h, l) => scP[+h + 2 * l] ||= h ? mk(SCENE_WGSL, 'rgba16float', 'fsh', { HQ: 1, LEAF: l }, 'always') : mk(SCENE_WGSL, 'rgba8unorm', 'fs', { LEAF: l });
+  let SP;
   // HQ setting: same scene shader with the HQ override on (HDR target) + bloom + tonemap passes.
   // Built and allocated only when HQ is switched on; standard mode never touches any of it.
   const fxq = qs.get('fx'); let hq = (fxq ?? localStorage.getItem('m7c-fx') ?? '1') === '1';
   const tq = qs.get('tod'); let tod = tq != null ? (isNaN(+tq) ? tq : +tq) : localStorage.getItem('m7c-tod') || 'cyc', Q = null, bt, lt, bgB, bgO;
-  const hqP = () => Q ||= { bake: dev.createComputePipeline({ layout: 'auto', compute: { module: dev.createShaderModule({ code: SCENE_WGSL }), entryPoint: 'bake' } }), scene: mk(SCENE_WGSL, 'rgba16float', 'fs', { HQ: 1 }), bloom: mk(HQ_WGSL, 'rgba16float', 'fb'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
+  const hqP = () => Q ||= { bake: dev.createComputePipeline({ layout: 'auto', compute: { module: dev.createShaderModule({ code: SCENE_WGSL }), entryPoint: 'bake' } }), splat: mk(SCENE_WGSL, 'rgba16float', 'sfs', { HQ: 1 }, 'less', 'svs'), bloom: mk(HQ_WGSL, 'rgba16float', 'fb'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
   const bgr = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map((resource, binding) => ({ binding, resource })) });
   // edges: 0 Pixel (classic), 1 Mjuka (edge-smoothing upscale), 2 Skarpa (near-native rays, art-size texels)
   const eq = qs.get('edge'); let edge = +(eq ?? localStorage.getItem('m7c-edge') ?? 2) % 3 || 0, art = 0;
   // internal-pixel budget: Skarpa starts at 40% of its cap and dynamic resolution climbs while frames are fast
   const amax = () => edge === 2 ? (hq ? 500000 : 1000000) : hq ? 70000 : 115000;
   const area0 = () => edge === 2 ? amax() * 0.4 : amax();
-  let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = +qs.get("area") || area0(), cross = 0;
+  let rt, dt, sgS, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = +qs.get("area") || area0(), cross = 0;
   // ordered 4x4 Bayer dithering to a limited palette in the upscale: 'auto' = HQ only, '1' on, '0' off
   const dq = qs.get('dither'); let dith = dq ?? localStorage.getItem('m7c-dither') ?? '0';
+  // leaves: 0 Block (old solid), 1 Löv (porous leaf sprites), 2 Löv+splats (HQ: + swaying leaf splats); 'auto' = 2 in HQ, 1 in Standard
+  const SPLATS = +qs.get('splats') || 24000;   // total splat cap
+  const lq = qs.get('leaf'); let leaf = lq ?? localStorage.getItem('m7c-leaf') ?? 'auto';
+  const leafM = () => { const m = leaf === 'auto' ? (hq ? 2 : 1) : +leaf || 0; return hq || m < 2 ? m : 1; };
+  const splatK = () => Math.max(1, Math.min(8, Math.round(8 * AREA / (+qs.get('area') || area0())), Math.floor(SPLATS / Math.max(nLeaf, 1))));
   const bset = () => dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, art, (edge === 1 ? 1 : 0) + (dith === '1' || (dith === 'auto' && hq) ? 2 : 0)]));
   const resize = () => {
     const d = Math.min(devicePixelRatio || 1, 3);
@@ -116,12 +138,14 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     // Skarpa: fractional scale (up to native, capped by the pixel budget); art = the classic pixel size in internal pixels
     if (edge === 2) { px = Math.max(1, Math.sqrt(W * H / AREA)); art = Math.max(1, Math.round(Math.sqrt(W * H / (hq ? 70000 : 115000)))) / px; } else art = 0;
     iw = Math.ceil(W / px); ih = Math.ceil(H / px);
-    rt?.destroy(); bt?.destroy(); lt?.destroy(); bt = lt = null;
+    rt?.destroy(); dt?.destroy(); bt?.destroy(); lt?.destroy(); bt = lt = dt = null;
     const u = T.RENDER_ATTACHMENT | T.TEXTURE_BINDING;
     rt = dev.createTexture({ size: [iw, ih], format: hq ? 'rgba16float' : 'rgba8unorm', usage: u });
-    sg = bgr(hq ? hqP().scene : scene, [{ buffer: ub }, vox.createView(), hm.createView(), { buffer: tb }, { buffer: scb }]);
-    if (hq) Q.bg ||= dev.createBindGroup({ layout: Q.bake.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ub } }, { binding: 1, resource: vox.createView() }, { binding: 4, resource: { buffer: scb } }] });
+    if (hq) hqP(); SP = sceneP(hq, +(leafM() > 0)); sg = bgr(SP, [{ buffer: ub }, vox.createView(), hm.createView(), { buffer: tb }, { buffer: scb }]);
+    if (hq) Q.bg ||= dev.createBindGroup({ layout: Q.bake.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ub } }, { binding: 1, resource: vox.createView() }, { binding: 7, resource: { buffer: scb } }] });
     if (hq) {
+      dt = dev.createTexture({ size: [iw, ih], format: 'depth32float', usage: T.RENDER_ATTACHMENT });
+      sgS = dev.createBindGroup({ layout: Q.splat.getBindGroupLayout(0), entries: [[0, { buffer: ub }], [1, vox.createView()], [3, { buffer: tb }], [4, { buffer: scb2 }], [5, { buffer: lfb }]].map(([binding, resource]) => ({ binding, resource })) });
       bt = dev.createTexture({ size: [Math.ceil(iw / 4), Math.ceil(ih / 4)], format: 'rgba16float', usage: u });
       lt = dev.createTexture({ size: [iw, ih], format: 'rgba8unorm', usage: u });
       bgB = bgr(Q.bloom, [rt.createView()]); bgO = bgr(Q.out, [rt.createView(), bt.createView(), Q.sm]);
@@ -206,14 +230,15 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const panel = $('#s'); let row = 0, aSel = 0;
   const opened = () => panel.classList.contains('on');
   const syncPanel = () => {
-    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge, dith }[e.dataset.k])));
+    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge, dith, leaf: leaf === 'auto' ? (hq ? 2 : 1) : +leaf }[e.dataset.k])));
     panel.querySelectorAll('p').forEach((e, i) => e.classList.toggle('f', i === row));
-    panel.querySelectorAll('[data-a]').forEach((e, i) => e.classList.toggle('on', row === 4 && i === aSel));
+    panel.querySelectorAll('[data-a]').forEach((e, i) => e.classList.toggle('on', row === 5 && i === aSel));
   };
   const ACT = { exp: exportWorld, imp: () => fileIn.click(), shr: shareLink };
   const runAct = () => ACT[panel.querySelectorAll('[data-a]')[aSel].dataset.a]();
   const setOpt = (k, v) => {
     if (k === 'fx') { if (hq !== (v === '1')) { hq = v === '1'; localStorage.setItem('m7c-fx', +hq); AREA = area0(); slow = fast = 0; ceil = 1e9; resize(); } }
+    else if (k === 'leaf') { leaf = v; localStorage.setItem('m7c-leaf', v); resize(); }
     else if (k === 'dith') { dith = v; localStorage.setItem('m7c-dither', v); bset(); }
     else if (k === 'edge') { if (edge !== +v) { edge = +v; localStorage.setItem('m7c-edge', v); AREA = area0(); slow = fast = 0; ceil = 1e9; resize(); } }
     else { tod = v; localStorage.setItem('m7c-tod', v); }
@@ -221,12 +246,12 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   };
   const togglePanel = () => { if (panel.classList.toggle('on') && document.pointerLockElement) document.exitPointerLock(); syncPanel(); };
   const stepOpt = (dir) => {
-    if (row === 4) { aSel = (aSel + dir + 3) % 3; return syncPanel(); }
+    if (row === 5) { aSel = (aSel + dir + 3) % 3; return syncPanel(); }
     const o = [...panel.querySelectorAll('p')[row].querySelectorAll('i')], i = o.findIndex((e) => e.classList.contains('on')), e = o[(i + dir + o.length) % o.length]; setOpt(e.dataset.k, e.dataset.v);
   };
-  const moveRow = (dir) => { row = (row + dir + 5) % 5; syncPanel(); };
-  const enter = () => (row === 4 ? runAct() : stepOpt(1));
-  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = ['fx', 'tod', 'edge', 'dith'].indexOf(d.k); setOpt(d.k, d.v); } if (d.a) { row = 4; aSel = Object.keys(ACT).indexOf(d.a); syncPanel(); ACT[d.a](); } });
+  const moveRow = (dir) => { row = (row + dir + 6) % 6; syncPanel(); };
+  const enter = () => (row === 5 ? runAct() : stepOpt(1));
+  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = ['fx', 'tod', 'edge', 'dith', 'leaf'].indexOf(d.k); setOpt(d.k, d.v); } if (d.a) { row = 5; aSel = Object.keys(ACT).indexOf(d.a); syncPanel(); ACT[d.a](); } });
   $('#g').addEventListener('click', togglePanel);
   for (const el of [panel, $('#g')]) el.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
   syncPanel();
@@ -359,10 +384,17 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     const enc = dev.createCommandEncoder();
     // re-bake the sun-shadow cache only when the sun has moved > ~0.4 deg or the world changed
     if (hq && (fb || bakeDirty || !bakedL || (sunD[0] * bakedL[0] + sunD[1] * bakedL[1] + sunD[2] * bakedL[2]) / Math.hypot(...sunD) / Math.hypot(...bakedL) < 0.999976)) {
-      const c = enc.beginComputePass(); c.setPipeline(Q.bake); c.setBindGroup(0, Q.bg); c.dispatchWorkgroups(N * N * NZ / 256); c.end();
+      const c = enc.beginComputePass(); c.setPipeline(Q.bake); c.setBindGroup(0, Q.bg); c.dispatchWorkgroups(N * N * NZ / 256); c.end(); enc.copyBufferToBuffer(scb, 0, scb2, 0, N * N * NZ);
       bakedL = sunD; bakeDirty = false; bakes++;
     }
-    pass(enc, rt, hq ? Q.scene : scene, sg);
+    if (hq) {
+      // HQ scene writes depth; leaf splats (Löv+splats) are depth-tested against it in the same pass
+      if (leafDirty) leafList();
+      const p = enc.beginRenderPass({ colorAttachments: [{ view: rt.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }], depthStencilAttachment: { view: dt.createView(), depthLoadOp: 'clear', depthClearValue: 1, depthStoreOp: 'discard' } });
+      p.setPipeline(SP); p.setBindGroup(0, sg); p.draw(3);
+      if (leafM() === 2 && nLeaf) { p.setPipeline(Q.splat); p.setBindGroup(0, sgS); p.draw(6, nLeaf * splatK()); }
+      p.end();
+    } else pass(enc, rt, SP, sg);
     if (hq) { pass(enc, bt, Q.bloom, bgB); pass(enc, lt, Q.out, bgO); }
     pass(enc, ctx.getCurrentTexture(), blit, bg);
     dev.queue.submit([enc.finish()]);
@@ -418,7 +450,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     for (const q of parts) { q.life -= dt; q.v[2] -= 18 * dt; for (let k = 0; k < 3; k++) q.p[k] += q.v[k] * dt; }
     while (parts.length && parts[parts.length - 1].life <= 0) parts.pop();
     U.fill(0);
-    U.set([iw, ih, now / 1000 + t0, tanV, ...cam.o, V.fog, ...F, far, ...R, iw / ih, ...Up, 0, st[0], st[1], st[2], 0, st[4], st[5], st[6], st[7], V.fps ? 1 : 0, 0, 0, 0]);
+    U.set([iw, ih, now / 1000 + t0, tanV, ...cam.o, V.fog, ...F, far, ...R, iw / ih, ...Up, leafM(), st[0], st[1], st[2], nLeaf, st[4], st[5], st[6], st[7], V.fps ? 1 : 0, 0, 0, 0]);
     if (hl) U.set([...hl.b, 1], 32);
     U[39] = edge === 1 ? -1 : art;
     if (hq) { const [d, c, sky, w] = sun(now / 1000 + t0); U.set(sky, 29); U.set([...d, 0, ...c, w], 72); sunD = d; }
@@ -448,7 +480,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     }
     requestAnimationFrame(frame);
   };
-  window.m7 = { act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; }, get area() { return AREA; } }; // handy for tests
+  window.m7 = { act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; }, get area() { return AREA; }, get splats() { return leafM() === 2 ? nLeaf * splatK() : 0; }, get leaves() { return nLeaf; } }; // handy for tests
   // shared world link (#w=...): load it, then drop the hash so later local edits stay local
   const hw = location.hash.match(/^#w=([\w-]+)/);
   if (hw) { history.replaceState(null, '', location.pathname + location.search); try { await importBytes(unb64(hw[1])); } catch { toast('Ogiltig l\u00e4nk'); } }

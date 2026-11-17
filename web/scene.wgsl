@@ -12,7 +12,8 @@ struct V { @builtin(position) p: vec4f };
 @group(0) @binding(3) var<uniform> TL: array<vec4f, 32>;   // nearest torches: xyz + flicker (own buffer: keeps U small)
 // HQ sun-shadow cache, one byte per block cell (4 per u32): 0 = all dark, 255 = all lit, 128 = mixed/unknown.
 // Baked by the `bake` compute pass only when the sun moves or the world changes.
-@group(0) @binding(4) var<storage, read_write> SC: array<u32>;
+@group(0) @binding(4) var<storage, read> SC: array<u32>;
+@group(0) @binding(7) var<storage, read_write> SCW: array<u32>;   // same buffer, written only by the bake pass
 
 const N = 128; const NZ = 16; const S = 8.; const ZW = 2.75; const CB = 15.5; 
 const TR = 0.34; // trunk radius
@@ -95,6 +96,35 @@ fn cloud(p: vec2f) -> f32 {
   return hmax;
 }
 struct Hit { t: f32, id: u32, n: vec3f };
+// ---- porous leaves (v10, 'Löv'): every face a ray crosses into, out of or between leaf voxels is an
+// alpha-tested 8x8 pixel-art leaf sprite (flipped/rotated per face), so crowns get holes, inner layers
+// and a ragged rim. Off (LEAF = 0) compiles the old solid-block path.
+override LEAF = 0;   // pipeline constant: 1 = porous leaves
+fn leafOn() -> bool { return LEAF > 0; }
+fn lbit(q: vec2i, f: u32) -> bool {   // q in 0..7: transpose / mirror (x ^ 7 = 7 - x) per variant, then one mask bit
+  var a = select(q, q.yx, (f & 1u) != 0u); a ^= vec2i(select(0, 7, (f & 2u) != 0u), select(0, 7, (f & 4u) != 0u));
+  return ((select(0x66dff56cu, 0x9ebbef66u, a.y < 4) >> u32((a.y & 3) * 8 + a.x)) & 1u) != 0u;
+}
+// face texel coords + sprite variant for a point on a block face with normal n
+fn lface(pe: vec3f, n: vec3f) -> vec3i {
+  let an = abs(n); let uv = select(select(pe.xy, pe.xz, an.y > 0.5), pe.yz, an.x > 0.5);
+  let k = vec3i(floor(pe - an * 0.5));
+  return vec3i(clamp(vec2i(floor(fract(uv) * S)), vec2i(0), vec2i(7)), (k.x * 5 + k.y * 3 + k.z * 7 + (k.x ^ k.y) * 2) & 7);
+}
+// branch-light (it runs inside the DDA loops): sprite bit, and on outer faces half the rim texels drop out
+fn leafHit(pe: vec3f, n: vec3f, outer: bool) -> bool {
+  let q = lface(pe, n); let t = vec3i(floor(pe * S));
+  let rim = outer && (any(q.xy == vec2i(0)) || any(q.xy == vec2i(7))) && ((u32(t.x * 73 + t.y * 151 + t.z * 211) * 0x9e3779b9u) >> 31u) == 0u;
+  return lbit(q.xy, u32(q.z)) && !rim;
+}
+fn lbitC(q: vec2i, f: u32) -> bool { return all(q >= vec2i(0)) && all(q <= vec2i(7)) && lbit(q, f); }
+// leaf colour: light where the leaf sprite has a gap above, dark with a gap below, speckled mid green
+fn leafCol(p: vec3f, n: vec3f) -> vec3f {
+  let q = lface(p, n); let f = u32(q.z);
+  if (!lbitC(q.xy + vec2i(0, 1), f)) { return c3(0xa6d24eu); }
+  if (!lbitC(q.xy - vec2i(0, 1), f)) { return c3(0x4f7d24u); }
+  return select(c3(0x86b83au), c3(0x6fa233u), h3(vec3i(floor(p * S))) < 0.3);
+}
 fn sinv(d: vec3f) -> vec3f { return 1. / select(d, vec3f(1e-9), abs(d) < vec3f(1e-9)); }
 // exact ray/AABB slab test: (t enter, t exit) + entry normal
 fn slab(ro: vec3f, inv: vec3f, rd: vec3f, b0: vec3f, b1: vec3f, n: ptr<function, vec3f>) -> vec2f {
@@ -105,7 +135,7 @@ fn slab(ro: vec3f, inv: vec3f, rd: vec3f, b0: vec3f, b1: vec3f, n: ptr<function,
 }
 // Exact voxel traversal (Amanatides-Woo DDA) over the block grid. Replaces fixed
 // slice stepping, which skipped texels at grazing angles and mis-guessed faces.
-fn traceBlocks(ro: vec3f, rd: vec3f, tA: f32, tB: f32, steps: i32) -> Hit {
+fn traceB0(ro: vec3f, rd: vec3f, tA: f32, tB: f32, steps: i32) -> Hit {
   var h: Hit; h.t = tB; h.id = 0u; h.n = vec3f(0., 0., 1.);
   let inv = sinv(rd); var n = vec3f(0., 0., 1.);
   let w = slab(ro, inv, rd, vec3f(0.), vec3f(f32(N), f32(N), f32(NZ)), &n);
@@ -139,6 +169,41 @@ fn traceBlocks(ro: vec3f, rd: vec3f, tA: f32, tB: f32, steps: i32) -> Hit {
     else if (tm.y < tm.z) { t = tm.y; tm.y += dl.y; c.y += st.y; n = vec3f(0., f32(-st.y), 0.); }
     else { t = tm.z; tm.z += dl.z; c.z += st.z; n = vec3f(0., 0., f32(-st.z)); }
     if (t > te || any(c < vec3i(0)) || c.x >= N || c.y >= N || c.z >= NZ) { break; }
+  }
+  return h;
+}
+// porous leaves (LEAF): the DDA above stops at a leaf cell as before; this walks the leaf cells
+// (testing every face crossed against the leaf sprite) and resumes the DDA behind them. Kept out of
+// the hot loop so the plain path compiles as before.
+fn leafWalk(ro: vec3f, rd: vec3f, t0: f32, n0: vec3f, skip: bool) -> Hit {
+  var h: Hit; h.id = 0u; h.n = n0; h.t = t0;
+  let inv = sinv(rd); let st = select(vec3i(-1), vec3i(1), rd > vec3f(0.)); let dl = abs(inv);
+  var c = vec3i(floor(ro + rd * (t0 + 1e-4)));
+  var tm = (vec3f(c) + select(vec3f(0.), vec3f(1.), rd > vec3f(0.)) - ro) * inv;
+  var t = t0; var n = n0; var pl = false; var il = true;
+  for (var i = 0; i < 10; i++) {
+    if (i > 0) { il = block(c) == 6u; }
+    let id = block(c);
+    if ((i > 0 || !skip) && leafHit(ro + rd * t, n, il != pl || i == 0)) { h.t = t; h.id = 6u; h.n = n; return h; }
+    if (!il) { h.t = t; h.n = n; h.id = select(id, 0u, id == 0u || id == 5u || id == 8u); if (h.id == 0u) { h.id = 255u; } return h; }
+    pl = il;
+    if (tm.x < tm.y && tm.x < tm.z) { t = tm.x; tm.x += dl.x; c.x += st.x; n = vec3f(f32(-st.x), 0., 0.); }
+    else if (tm.y < tm.z) { t = tm.y; tm.y += dl.y; c.y += st.y; n = vec3f(0., f32(-st.y), 0.); }
+    else { t = tm.z; tm.z += dl.z; c.z += st.z; n = vec3f(0., 0., f32(-st.z)); }
+    if (any(c < vec3i(0)) || c.x >= N || c.y >= N || c.z >= NZ) { h.t = t; h.id = 255u; return h; }
+  }
+  h.t = t; h.id = 255u; return h;
+}
+fn traceBlocks(ro: vec3f, rd: vec3f, tA: f32, tB: f32, steps: i32) -> Hit {
+  if (!leafOn()) { return traceB0(ro, rd, tA, tB, steps); }
+  var ta = tA; var h: Hit;
+  for (var k = 0; k < 4; k++) {
+    h = traceB0(ro, rd, ta, tB, steps);
+    if (h.id != 6u) { break; }
+    let r = leafWalk(ro, rd, h.t, h.n, h.t <= tA + 1e-4);
+    if (r.t >= tB) { h.t = tB; h.id = 0u; break; }
+    if (r.id != 255u) { h = r; break; }   // a leaf texel or a solid block right behind the leaves
+    ta = r.t + 1e-4; h.id = 0u; h.t = tB;
   }
   return h;
 }
@@ -303,7 +368,12 @@ fn water(d: vec3f, p: vec3f, sh: f32, dark: bool) -> WR {
 }
 fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z * 3., 0., 1.)); }
 
-@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+var<private> gZ = 1.;   // HQ: depth of the visible surface (for the leaf splats' depth test)
+fn zdep(t: f32, d: vec3f) -> f32 { return 1. - 0.05 / max(t * dot(d, U[2].xyz), 0.05); }
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f { return shade(fc); }
+struct FO { @location(0) c: vec4f, @builtin(frag_depth) z: f32 };
+@fragment fn fsh(@builtin(position) fc: vec4f) -> FO { let c = shade(fc); return FO(c, gZ); }
+fn shade(fc: vec4f) -> vec4f {
   let res = U[0].xy; let uv = fc.xy / res * 2. - 1.;
   let nd = vec2f(uv.x * U[3].w, -uv.y) * U[0].w;
   let o = U[1].xyz; let F = U[2].xyz; let R = U[3].xyz; let Up = U[4].xyz;
@@ -345,7 +415,7 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
   }
   let cloudCol = mix(cc, FOG, fogOn * smoothstep(far * 0.4, far, ct));
   // camera above the cloud layer: nothing can be in front of a cloud hit
-  if (ca > 0.5 && o.z > CB + 1.3) { if (HQ) { return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
+  if (ca > 0.5 && o.z > CB + 1.3) { if (HQ) { gZ = zdep(ct, d); return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
   // ---- terrain: exact DDA through the block grid, then the avatar ----
   let tw = select(1e9, (ZW - o.z) / d.z, d.z < 0.);
   let tEnd = select(min(far, tw), min(ct, tw), ca > 0.5);
@@ -368,7 +438,7 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
     if (r.x <= r.y && r.x > 0. && r.x < hb.t) { hb.t = r.x; hb.id = 8u; hb.n = tn; part = false; }
   }
   var col: vec3f; var tt = hb.t; var gid = 251.;   // surface id (sky 251, water 250, planes 0..239, avatar 253)
-  if (hb.id == 0u && ca > 0.5 && ct < tw) { if (HQ) { return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
+  if (hb.id == 0u && ca > 0.5 && ct < tw) { if (HQ) { gZ = zdep(ct, d); return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
   if (hb.id == 0u) {
     if (tw > far) { col = sky(d); tt = 0.; if (HQ) { col = hqSky(d); tt = far; } }
     else {
@@ -386,7 +456,7 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
     gid = f32((u32(face + select(0, 3, dot(n, vec3f(1.)) < 0.)) * 41u + u32(round(abs(dot(p, n))) + 64.) * 7u) % 240u);
     if (isLog) { gid = f32(hh(u32(floor(p.x)) * 977u + u32(floor(p.y))) % 240u); }
     if (hb.id >= 8u || part) { gid = select(248., 253., hb.id >= 10u); }
-    col = select(matCol(hb.id, ht, face), birch(p, n), isLog); let base0 = col;
+    col = select(matCol(hb.id, ht, face), birch(p, n), isLog); if (hb.id == 6u && leafOn() && !part) { col = leafCol(p, n); } let base0 = col;
     var lit = 1.;
     if (HQ) { col = hqShade(p, n, ht, hb.id, isLog, part, col); }
     else if (isLog) {
@@ -426,7 +496,7 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
     }
   }
   let ga = select(1., gid / 255., U[9].w < 0.);
-  if (HQ) { return vec4f(hqAtmo(o, d, tt, far, fogOn, col, fc.xy), ga); }
+  if (HQ) { if (tt > 0. && tt < far * 0.999) { gZ = zdep(tt, d); } return vec4f(hqAtmo(o, d, tt, far, fogOn, col, fc.xy), ga); }
   col = mix(col, FOG, fogOn * smoothstep(far * 0.35, far, tt));
   return vec4f(col, ga);
 }
@@ -466,26 +536,51 @@ fn hqAO(c: vec3i, n: vec3f, p: vec3f) -> f32 {
 }
 // sun transmittance along a ray: leaves pass light through texel gaps (dappled light), logs are
 // round, torches let light by, anything else is opaque
-fn hqTrans(ro: vec3f, rd: vec3f, steps: i32) -> f32 {
+fn hqT0(ro: vec3f, rd: vec3f, tA: f32, steps: i32) -> vec2f {   // (transmittance, where it stopped at leaves or -1)
   let inv = sinv(rd); var n = vec3f(0.);
   let w = slab(ro, inv, rd, vec3f(0.), vec3f(f32(N), f32(N), f32(NZ)), &n);
-  var t = max(0., w.x); if (t >= w.y) { return 1.; }
+  var t = max(tA, w.x); if (t >= w.y) { return vec2f(1., -1.); }
   let st = select(vec3i(-1), vec3i(1), rd > vec3f(0.)); let dl = abs(inv);
   var c = clamp(vec3i(floor(ro + rd * (t + 1e-4))), vec3i(0), vec3i(N - 1, N - 1, NZ - 1));
   var tm = (vec3f(c) + select(vec3f(0.), vec3f(1.), rd > vec3f(0.)) - ro) * inv; var T = 1.;
   for (var i = 0; i < steps; i++) {
     let id = block(c); let tx = min(min(tm.x, tm.y), tm.z);
     if (id == 6u) {
+      if (LEAF > 0) { return vec2f(T, t); }
       T *= select(0.12, 0.8, h3(vec3i(floor((ro + rd * (t + tx) * 0.5) * S))) < 0.4);
-      if (T < 0.02) { return 0.; }
+      if (T < 0.02) { return vec2f(0., -1.); }
     } else if (id == 5u) {
       let oc = ro.xy - (vec2f(c.xy) + .5); let a = max(dot(rd.xy, rd.xy), 1e-9);
-      if (length(oc + rd.xy * clamp(-dot(oc, rd.xy) / a, t, tx)) < TR) { return 0.; }
-    } else if (id != 0u && id != 8u) { return 0.; }
+      if (length(oc + rd.xy * clamp(-dot(oc, rd.xy) / a, t, tx)) < TR) { return vec2f(0., -1.); }
+    } else if (id != 0u && id != 8u) { return vec2f(0., -1.); }
     if (tm.x < tm.y && tm.x < tm.z) { t = tm.x; tm.x += dl.x; c.x += st.x; }
     else if (tm.y < tm.z) { t = tm.y; tm.y += dl.y; c.y += st.y; }
     else { t = tm.z; tm.z += dl.z; c.z += st.z; }
     if (t > w.y || any(c < vec3i(0)) || c.x >= N || c.y >= N || c.z >= NZ) { break; }
+  }
+  return vec2f(T, -1.);
+}
+fn hqTrans(ro: vec3f, rd: vec3f, steps: i32) -> f32 {
+  if (LEAF == 0) { return hqT0(ro, rd, 0., steps).x; }
+  var T = 1.; var ta = 0.;
+  for (var k = 0; k < 4; k++) {
+    let r = hqT0(ro, rd, ta, steps); T *= r.x; if (r.y < 0.) { break; }
+    // walk the leaf cells: every sprite texel crossed lets 15% through
+    let inv = sinv(rd); let st = select(vec3i(-1), vec3i(1), rd > vec3f(0.)); let dl = abs(inv);
+    var t = r.y; var c = vec3i(floor(ro + rd * (t + 1e-4))); var n = -vec3f(st) * vec3f(0., 0., 1.); var pl = false;
+    var tm = (vec3f(c) + select(vec3f(0.), vec3f(1.), rd > vec3f(0.)) - ro) * inv;
+    { let f = abs(ro + rd * t - round(ro + rd * t)); n = select(select(vec3f(0., 0., -f32(st.z)), vec3f(0., -f32(st.y), 0.), f.y < f.z), vec3f(-f32(st.x), 0., 0.), f.x < min(f.y, f.z)); }
+    for (var i = 0; i < 10; i++) {
+      let id = block(c); let il = id == 6u;
+      if ((il || pl) && (i > 0 || t > 1e-4) && leafHit(ro + rd * t, n, il != pl)) { T *= 0.15; if (T < 0.02) { return 0.; } }
+      if (!il) { if (id != 0u && id != 5u && id != 8u) { return 0.; } break; }
+      pl = il;
+      if (tm.x < tm.y && tm.x < tm.z) { t = tm.x; tm.x += dl.x; c.x += st.x; n = vec3f(f32(-st.x), 0., 0.); }
+      else if (tm.y < tm.z) { t = tm.y; tm.y += dl.y; c.y += st.y; n = vec3f(0., f32(-st.y), 0.); }
+      else { t = tm.z; tm.z += dl.z; c.z += st.z; n = vec3f(0., 0., f32(-st.z)); }
+      if (any(c < vec3i(0)) || c.x >= N || c.y >= N || c.z >= NZ) { return T; }
+    }
+    ta = t + 1e-4;
   }
   return T;
 }
@@ -547,7 +642,7 @@ fn bakeCell(c: vec3i) -> u32 {
   if (g.x >= u32(N * N * NZ / 4)) { return; }
   var o = 0u;
   for (var j = 0u; j < 4u; j++) { let i = i32(g.x * 4u + j); o |= bakeCell(vec3i(i % N, (i / N) % N, i / (N * N))) << (j * 8u); }
-  SC[g.x] = o;
+  SCW[g.x] = o;
 }
 fn hqSky(d: vec3f) -> vec3f {
   let L = sunL(); let sc = U[19].xyz; let mu = max(dot(d, L), 0.);
@@ -629,4 +724,53 @@ fn hqAtmo(o: vec3f, d: vec3f, tt: f32, far: f32, fogOn: f32, col: vec3f, fc: vec
   let dens = 1. - exp(-len * 0.006);
   var c = col + U[19].xyz * (vis / 6.) * ph * (1. - exp(-len * 0.03)) * 0.12 + U[7].yzw * dens * 0.02;
   return mix(c, hqSky(d), fogOn * smoothstep(far * 0.35, far, tt));
+}
+
+// ---- leaf splats (v10, HQ 'Löv+splats'): small swaying gaussian leaf sprites on the crown surface ----
+// LF = exposed leaf voxels (index | open-face mask << 18), U[5].w = their count. Instance i is splat
+// i / count of voxel i % count, so drawing fewer instances thins every crown evenly.
+@group(0) @binding(5) var<storage, read> LF: array<u32>;
+struct SV { @builtin(position) p: vec4f, @location(0) @interpolate(flat) c: vec4f, @location(1) q: vec2f };
+@vertex fn svs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> SV {
+  var o: SV; o.p = vec4f(0., 0., 2., 1.);
+  let nv = u32(U[5].w); let e = LF[ii % nv]; let k = ii / nv; let ix = i32(e & 0x3ffffu); let m = e >> 18u;
+  let cell = vec3i(ix % N, (ix / N) % N, ix / (N * N));
+  let h = hh(e * 31u + k * 977u); let r = vec4f(vec4u(h, h >> 8u, h >> 16u, h >> 24u) & vec4u(255u)) / 255.;
+  // pick the (k-th) open face, sit on it and poke a little outwards
+  var f = 0u; var c = 0u; let want = (k + h) % u32(countOneBits(m));
+  for (var j = 0u; j < 6u; j++) { if (((m >> j) & 1u) != 0u) { if (c == want) { f = j; } c++; } }
+  var fn3 = vec3f(0.); fn3[f / 2u] = select(-1., 1., (f & 1u) == 0u);
+  let t = U[0].z; var P = vec3f(cell) + .5 + (r.xyz - .5) * 0.9 * (1. - abs(fn3)) + fn3 * (0.45 + r.w * 0.3);
+  let ph = P.x * 0.7 + P.y * 0.9 + r.w * 6.3; let gust = 1. + 0.6 * sin(t * 0.37 + P.x * 0.06 + P.y * 0.04);
+  P += (vec3f(sin(t * 1.6 + ph), cos(t * 1.3 + ph * 1.7), 0.) * 0.035 + vec3f(0., 0., sin(t * 2.1 + ph) * 0.015)) * gust;
+  let O = U[1].xyz; let F = U[2].xyz; let Rr = U[3].xyz; let Up = U[4].xyz; let v = P - O; let z = dot(v, F); let dist = length(v);
+  // distance thinning (keep ~2 per voxel far away) + view cull
+  if (z < 1.2 || dist > U[2].w * 0.85 || f32(k) >= 8. * clamp(10. / dist, 0.3, 1.)) { return o; }
+  // leaf ellipse: ~0.16 x 0.08 blocks, at least ~1 art pixel wide, random roll
+  let pw = z * 2. * U[0].w / U[0].y * max(U[9].w, 1.);
+  let sx = max(0.13 + r.x * 0.08, pw * 1.1); let sy = max(sx * 0.55, pw * 0.8); let a = r.y * 6.2832;
+  let qv = vec2f(f32((0x1au >> vi) & 1u), f32((0x34u >> vi) & 1u)) * 4. - 2.;   // 2 triangles, +-2 sigma
+  let lq = vec2f(qv.x * sx, qv.y * sy); let rq = vec2f(cos(a) * lq.x - sin(a) * lq.y, sin(a) * lq.x + cos(a) * lq.y);
+  let w = v + Rr * rq.x + Up * rq.y; let zz = dot(w, F);
+  o.p = vec4f(dot(w, Rr) / (U[3].w * U[0].w), dot(w, Up) / U[0].w, zz - 0.05, zz); o.q = qv;
+  // lighting once per splat: sun (baked cache, else one transmittance ray) + sky, palette-snapped
+  let L = sunL(); let nr = normalize(fn3 + (r.zxy - .5) * 0.9 + vec3f(0., 0., 0.35));
+  var sh = 0.;
+  if (L.z > 0.02) {
+    let sc = scache(vec3i(floor(P))); sh = select(select(hqTrans(P, L, 12), 1., sc == 255u), 0., sc == 0u);
+    let qc = P.xy + L.xy * ((CB + 0.6 - P.z) / L.z); if (cloud((floor(qc * S) + .5) / S) > 0.) { sh *= 0.3; }
+  }
+  let ndl = dot(nr, L); let lit = floor((max(ndl, 0.) + max(-ndl, 0.) * 0.35) * sh * 4. + 0.5) / 4.;
+  let pal = array<u32, 4>(0x4f7d24u, 0x6fa233u, 0x86b83au, 0xa6d24eu);
+  let alb = lin(c3(pal[min(u32(r.z * 4.), 3u)]));
+  var col = alb * (U[19].xyz * lit + U[7].yzw * (0.9 + 0.25 * nr.z));
+  if (U[9].z > 0.) { col += alb * torchL(P, nr, false) * 1.2; }
+  col = mix(col, hqSky(v / dist), U[1].w * smoothstep(U[2].w * 0.35, U[2].w, dist));
+  o.c = vec4f(col, select(1., 247. / 255., U[9].w < 0.));
+  return o;
+}
+// gaussian falloff, stochastic (art-pixel Bayer) alpha: order-independent, crisp pixel-art edges
+@fragment fn sfs(i: SV) -> @location(0) vec4f {
+  if (exp(-0.5 * dot(i.q, i.q)) < bayer4(vec2i(floor(i.p.xy / max(U[9].w, 1.)))) * 0.3 + 0.3) { discard; }   // mostly solid, thin dithered rim
+  return i.c;
 }
