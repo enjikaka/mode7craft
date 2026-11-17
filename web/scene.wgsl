@@ -10,6 +10,9 @@ struct V { @builtin(position) p: vec4f };
 @group(0) @binding(1) var vox: texture_3d<u32>;
 @group(0) @binding(2) var hm: texture_2d<u32>;
 @group(0) @binding(3) var<uniform> TL: array<vec4f, 32>;   // nearest torches: xyz + flicker (own buffer: keeps U small)
+// HQ sun-shadow cache, one byte per block cell (4 per u32): 0 = all dark, 255 = all lit, 128 = mixed/unknown.
+// Baked by the `bake` compute pass only when the sun moves or the world changes.
+@group(0) @binding(4) var<storage, read_write> SC: array<u32>;
 
 const N = 128; const NZ = 16; const S = 8.; const ZW = 2.75; const CB = 15.5; 
 const TR = 0.34; // trunk radius
@@ -227,7 +230,15 @@ fn birch(p: vec3f, n: vec3f) -> vec3f {
   return c;
 }
 // ---- layered water (v7): stepped depth bands over a visible, teal-tinted sea floor ----
-struct WR { c: vec3f, k: f32, a: f32 };   // colour, k=1 foam/sparkle (stays bright), a = band opacity
+struct WR { c: vec3f, k: f32, a: f32, g: f32 };   // colour, k=1 foam/sparkle (stays bright), a = band opacity, g = sun glitter
+// sun path: each texel is a random facet (re-rolled in frame steps); it flashes when its tilt would mirror
+// the sun into the eye, so flashes crowd into a glittering path under the sun (long when the sun is low)
+fn glit(t: vec2i, d: vec3f, L: vec3f) -> f32 {
+  if (L.z < 0.02) { return 0.; }
+  let hv = normalize(L - d); let s = hv.xy / max(hv.z, 0.05);
+  let pr = exp(-dot(s, s) * 110.); let st = i32(U[0].z * 5.); let r = h2(t + vec2i(st * 37, st * 11));
+  return select(0., select(0.55, 1., r < pr * 0.12), r < pr * 0.32);
+}
 fn hcl(b: vec2i) -> f32 { return f32(min(height(b), 3)); }
 // solid at water level under texel t (blocks, leaves, round logs; torches don't count)
 fn wsol(t: vec2i) -> bool {
@@ -274,6 +285,8 @@ fn water(d: vec3f, p: vec3f, sh: f32, dark: bool) -> WR {
   if (lit && h2(t) > select(0.9985, 0.982, db < 1.95) && ((i32(tm * 2.) + i32(h2(t + vec2i(71, 3)) * 5.)) % 5) < 2) {
     c = select(c3(0xbfeaf7u), vec3f(0.97, 0.99, 1.), h2(t + vec2i(5, 9)) > 0.45); k = 1.;
   }
+  var sg = 0.; if (lit) { sg = glit(t, d, select(sunL(), SUN, dark)); }
+  if (sg > 0. && dark) { c = mix(c, c3(0xfff2c4u), sg); k = 1.; }
   // 1-px shoreline where the surface meets anything solid (coast, placed blocks, trunks), pulsing slowly
   let ph = i32(tm * 1.5);
   let lg = block(vec3i(t >> vec2u(3u), 2)) == 5u;
@@ -286,7 +299,7 @@ fn water(d: vec3f, p: vec3f, sh: f32, dark: bool) -> WR {
     if (r > 0.26 && r < 0.38 && h2(t + vec2i(ph * 5, 0)) > 0.25) { c = vec3f(0.95, 0.99, 1.); k = 1.; }
     else if (abs(r - ro) < 0.06 && h2(t) > 0.35) { c = mix(c, c3(0xc8eefau), 0.7); }
   }
-  return WR(c, k, a);
+  return WR(c, k, a, sg);
 }
 fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z * 3., 0., 1.)); }
 
@@ -480,13 +493,61 @@ fn hqTrans(ro: vec3f, rd: vec3f, steps: i32) -> f32 {
 // widens with blocker distance; clouds cast a translucent shadow
 fn hqShadow(p: vec3f, k: f32) -> f32 {
   let L = sunL(); if (L.z < 0.02) { return 0.; }
+  let sc = scache(vec3i(floor(p))); if (sc == 0u) { return 0.; }   // baked: whole cell in shadow
   let t1 = normalize(cross(L, vec3f(0., 0., 1.))); let t2 = cross(L, t1); var v = 0.;
   for (var i = 0; i < 3; i++) {
     let a = (f32(i) + k) * 2.0944; let r = normalize(L + (t1 * cos(a) + t2 * sin(a)) * 0.075);
-    if (tracePlayer(p, r, 16.).id == 0u) { v += hqTrans(p, r, 28); }
+    // baked fully-lit cells only test the (moving) avatar; mixed cells trace the world as before
+    if (tracePlayer(p, r, 16.).id == 0u) { if (sc == 255u) { v += 1.; } else { v += hqTrans(p, r, 28); } }
   }
   let qc = p.xy + L.xy * ((CB + 0.6 - p.z) / L.z);
   return v / 3. * select(1., 0.3, cloud((floor(qc * S) + .5) / S) > 0.);
+}
+fn scache(c: vec3i) -> u32 {
+  if (any(c < vec3i(0)) || c.x >= N || c.y >= N || c.z >= NZ) { return 128u; }
+  let i = (c.z * N + c.y) * N + c.x; return (SC[i >> 2u] >> (u32(i & 3) * 8u)) & 255u;
+}
+// bake ray: 0 = blocked by a full block, 1 = clear, 2 = passes leaves / near a log (needs per-pixel tracing)
+fn bakeRay(ro: vec3f, rd: vec3f) -> u32 {
+  let inv = sinv(rd); var n = vec3f(0.);
+  let w = slab(ro, inv, rd, vec3f(0.), vec3f(f32(N), f32(N), f32(NZ)), &n);
+  var t = max(0., w.x); if (t >= w.y) { return 1u; }
+  let st = select(vec3i(-1), vec3i(1), rd > vec3f(0.)); let dl = abs(inv);
+  var c = clamp(vec3i(floor(ro + rd * (t + 1e-4))), vec3i(0), vec3i(N - 1, N - 1, NZ - 1));
+  var tm = (vec3f(c) + select(vec3f(0.), vec3f(1.), rd > vec3f(0.)) - ro) * inv;
+  for (var i = 0; i < 28; i++) {
+    let id = block(c);
+    if (id == 5u || id == 6u) { return 2u; } else if (id != 0u && id != 8u) { return 0u; }
+    if (tm.x < tm.y && tm.x < tm.z) { t = tm.x; tm.x += dl.x; c.x += st.x; }
+    else if (tm.y < tm.z) { t = tm.y; tm.y += dl.y; c.y += st.y; }
+    else { t = tm.z; tm.z += dl.z; c.z += st.z; }
+    if (t > w.y || any(c < vec3i(0)) || c.x >= N || c.y >= N || c.z >= NZ) { break; }
+  }
+  return 1u;
+}
+// classify one air cell next to a surface (or at water level): 3x3x3 points x the 3-ray sun cone
+fn bakeCell(c: vec3i) -> u32 {
+  let id = block(c); if (id != 0u && id != 8u) { return 128u; }
+  var nb = c.z == 2;
+  for (var k = 0; k < 6; k++) { var e = vec3i(0); e[k / 2] = select(-1, 1, (k & 1) == 0); let b = block(c + e); nb = nb || (b != 0u && b != 8u); }
+  if (!nb) { return 128u; }
+  let L = sunL(); if (L.z < 0.02) { return 0u; }
+  let t1 = normalize(cross(L, vec3f(0., 0., 1.))); let t2 = cross(L, t1); var lit = 0u; var tot = 0u;
+  for (var j = 0; j < 9; j++) {   // 8 corners + centre
+    let o = vec3i(j & 1, (j >> 1) & 1, (j >> 2) & 1) * 2; var q = vec3f(c) + 0.02 + vec3f(o) * 0.48; if (j == 8) { q = vec3f(c) + 0.5; } let kk = h3(c * 3 + o + j);
+    for (var i = 0; i < 6; i++) {   // pixel rays lie on a 0.075 cone; sample just inside/outside its rim all round
+      let a = (f32(i) + kk) * 1.0472; let r = bakeRay(q, normalize(L + (t1 * cos(a) + t2 * sin(a)) * select(0.082, 0.068, (i & 1) == 0)));   // (covers the 0.4° the sun may drift before a rebake)
+      if (r == 2u) { return 128u; }
+      lit += r; tot += 1u; if (lit != 0u && lit != tot) { return 128u; }
+    }
+  }
+  return select(0u, 255u, lit > 0u);
+}
+@compute @workgroup_size(64) fn bake(@builtin(global_invocation_id) g: vec3u) {
+  if (g.x >= u32(N * N * NZ / 4)) { return; }
+  var o = 0u;
+  for (var j = 0u; j < 4u; j++) { let i = i32(g.x * 4u + j); o |= bakeCell(vec3i(i % N, (i / N) % N, i / (N * N))) << (j * 8u); }
+  SC[g.x] = o;
 }
 fn hqSky(d: vec3f) -> vec3f {
   let L = sunL(); let sc = U[19].xyz; let mu = max(dot(d, L), 0.);
@@ -529,6 +590,7 @@ fn hqWater(p: vec3f, d: vec3f) -> vec3f {
   let amb = U[7].yzw; let sun = U[19].xyz;
   var tl = vec3f(0.); if (U[9].z > 0.) { tl = torchL(p, vec3f(0., 0., 1.), false) * 1.5; }
   if (w.k > 0.5) { return base * (amb * 0.8 + sun * (0.4 + 0.45 * sh) + tl); }   // foam/sparkle: diffuse, no reflection
+  let gl = sun * w.g * 2.5 * sh;   // sun-path glitter (HDR: blooms, golden at a low sun)
   let wn = normalize(vec3f(vn(tq * 1.7 + tm * 0.7) - .5, vn(tq.yx * 1.3 - tm * 0.6) - .5, 9.));
   let r = reflect(d, wn);
   var rc = hqSky(r);
@@ -542,7 +604,7 @@ fn hqWater(p: vec3f, d: vec3f) -> vec3f {
   let fr = (0.03 + 0.6 * pow(1. - abs(d.z), 5.)) * mix(0.3, 1., w.a * w.a);
   var c = mix(base * (amb * 0.85 + sun * (0.12 + 0.38 * sh)), rc, fr);
   c += base * tl;
-  return c + sun * pow(max(dot(r, sunL()), 0.), 900.) * 8. * sh * w.a;   // sun glint
+  return c + gl + sun * pow(max(dot(r, sunL()), 0.), 900.) * 8. * sh * w.a;   // sun glint
 }
 fn hqCloud(cc: vec3f, t: f32, o: vec3f, d: vec3f) -> vec3f {
   let c = lin(cc) * (U[19].xyz * 1.1 + U[7].yzw * 0.6);
@@ -557,7 +619,10 @@ fn hqAtmo(o: vec3f, d: vec3f, tt: f32, far: f32, fogOn: f32, col: vec3f, fc: vec
     let q = o + d * (len * (f32(k) + j) / 6.);
     let qc = q.xy + L.xy * ((CB + 0.6 - q.z) / max(L.z, 0.05)); let hq = f32(height(vec2i(floor(q.xy))));
     let lit = q.z > hq && (q.z > CB || cloud((floor(qc * S) + .5) / S) <= 0.);
-    if (lit) { vis += select(1., hqTrans(q, L, 8), ph > 0.4 && q.z < hq + 7.); }   // crown gaps (near the ground, towards the sun)
+    if (lit) {   // crown gaps (near the ground, towards the sun); baked cells skip the trace
+      var v = 1.; if (ph > 0.4 && q.z < hq + 7.) { let sc = scache(vec3i(floor(q))); if (sc == 0u) { v = 0.; } else if (sc != 255u) { v = hqTrans(q, L, 8); } }
+      vis += v;
+    }
   }
   // in-scatter: strongly forward (shafts show when looking towards the sun), denser near the
   // ground so crown gaps throw visible rays even over a few blocks

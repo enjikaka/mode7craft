@@ -1,4 +1,4 @@
-# Mode7craft v8
+# Mode7craft v9
 
 ![Mode7craft](docs/screenshot.png)
 
@@ -11,6 +11,9 @@ A tiny Minecraft-style island rendered SNES Mode 7 / sprite-stacking style: no m
 - Edges (v8, settings row `Kanter`, saved as `m7c-edge`, `?edge=0|1|2`). The default `Pixel` is the classic look and is pixel-identical to v7.
   - `Mjuka` (cheap): edge-aware upscale in `blit.wgsl`. The scene writes a surface id into alpha (coplanar faces share one), and the blit applies a Scale2x-style corner rule with an anti-aliased 45-degree cut only where real geometry meets. Staircases on silhouettes, block steps and the shore become smooth diagonals; texture texels, dithering and water bands stay pixel-sharp. It costs 5 texel loads per screen pixel and nothing extra in the scene. Works in Standard and HQ.
   - `Skarpa` (native-res): rays are traced at up to native resolution. The budget is 1.0M internal pixels in Standard and 0.5M in HQ, DPR-aware, with a fractional scale. Because all shading already reads the 8x8 texel grid (textures, shadow probes, water texels, cloud cells), surfaces keep their big SNES texels while silhouettes, the shoreline, water-band edges and the avatar become crisp at screen resolution. Cloud dither, the target outline and the crosshair are scaled back to the classic pixel size (`U[9].w` / blit `B.z`). Dynamic resolution still steps the budget down by 0.75 until about 45 fps holds, so weak phones end up near the classic resolution.
+- Dithering (v9, settings row `Dither: Auto / På / Av`, saved as `m7c-dither`, `?dither=auto|1|0`). It is an ordered 4x4 Bayer dither in `blit.wgsl`: each channel is quantised to 16 levels per channel, and only the band transitions (±0.25 of a step) are dithered between the two neighbouring tones. Smooth gradients (sky, haze, golden-hour falloff, soft-shadow edges, HQ lighting) become SNES-style dithered bands. The Bayer cell follows the art-pixel grid, so it stays chunky in every edge mode (Pixel/Mjuka/Skarpa). It costs a few ALU ops per screen pixel and nothing in the scene. `Auto` (default) = on in HQ, off in Standard, so default Standard is unchanged.
+- Sun path on water (v9): the water surface is cut into per-texel facets with a frame-stepped hash. A facet flashes when its jittered half-vector lines up with the sun, so you get a glittering path of white-gold sparkles under the sun. It stretches out naturally at low sun (Kväll gives a long golden path) and follows the time of day in HQ, where it is HDR-lit and blooms. Standard uses the fixed sun. Shadowed water gets no glitter. HQ already had grazing-angle sky reflection (Fresnel), which is unchanged.
+- Baked sun shadows (v9, HQ): a compute pass (`bake` in `scene.wgsl`, run by `main.js`) classifies every air cell that touches a solid block (and the water surface layer) as fully lit, fully shadowed or mixed. It fires 6 rays around the shadow cone from 9 points per cell and stores 1 byte per cell (`SC`, 256 KB storage buffer). It reruns only when the sun direction moves more than about 0.4° (Cykel) or the world is edited or loaded. The bake samples just inside and outside the cone rim to cover that drift. Per pixel, the HQ soft-shadow cone (and the light-shaft samples) skips the world trace in lit or dark cells. Mixed cells (shadow edges, rays through leaves or near round logs) still trace exactly as before, and the avatar's own shadow is still traced. The result matches v8 to within a handful of low-res pixels.
 - Layered water (v7, Standard and HQ), after asynkimo's "Basic water tile vs Layered water":
   - Stepped depth bands, from semi-transparent shallow teal over the sand to opaque deep blue-teal. Depth comes from the sea-floor height, smoothed over block columns and jittered per 2x2 texels, so band edges are pixel-art steps that follow the slope.
   - The sea floor slopes at about half the land slope (generator change below sea level only), so there are wide shallow shelves.
@@ -29,8 +32,8 @@ A tiny Minecraft-style island rendered SNES Mode 7 / sprite-stacking style: no m
   - `Dela länk` creates `...#w=<base64url>`. On phones it uses the share sheet; on desktop it copies the link to the clipboard. Links over 30k chars are refused; use the file instead.
   - Opening a `#w=` link loads the world, removes the hash and saves the world to localStorage.
   - File format v1: `M7C` + version byte (1) + flags byte (1 = deflate-raw), then the deflate-raw (CompressionStream) payload, which is 3 bytes per edit: `(index delta << 4) | block id`, big-endian, with indices sorted. A typical house with torches (~80 edits) is about 90 bytes.
-- `web/blit.wgsl`: nearest-neighbour integer upscale of the low-res target.
-- Settings (gear button top-right, `G`, or Xbox Start/Menu): `Grafik: Standard / HQ` and `Tid (HQ): Dag / Kväll / Cykel`, saved in localStorage (`m7c-fx`, `m7c-tod`). Standard is the default and renders pixel-identically to v4. In the open panel (rows Grafik, Tid, Kanter, Värld), arrow keys / D-pad pick a row and change the value. On the `Värld` row, Enter / A runs the selected action. Esc / G / B / Start close the panel.
+- `web/blit.wgsl`: nearest-neighbour integer/fractional upscale of the low-res target, plus the Mjuka edge rule and the Bayer dither.
+- Settings (gear button top-right, `G`, or Xbox Start/Menu): `Grafik: Standard / HQ` and `Tid (HQ): Dag / Kväll / Cykel`, saved in localStorage (`m7c-fx`, `m7c-tod`). Standard is the default and renders pixel-identically to v4. In the open panel (rows Grafik, Tid, Kanter, Dither, Värld), arrow keys / D-pad pick a row and change the value. On the `Värld` row, Enter / A runs the selected action. Esc / G / B / Start close the panel.
 - HQ ("AAA shaders"): the same `scene.wgsl` built a second time with the pipeline-overridable constant `HQ=true`, so the standard pipeline compiles none of the HQ code. HQ lighting:
   - per-voxel AO
   - soft sun shadows (3-ray cone, sharp at contact), with translucent cloud shadows
@@ -50,9 +53,10 @@ A tiny Minecraft-style island rendered SNES Mode 7 / sprite-stacking style: no m
     node tools/test-edit.ts              # Node tests for pick/break/place/collision
     FREEZE=1 NOUI=1 node tools/shot.ts ...  # frozen clock + hidden DOM overlays: deterministic, diffable frames
     python3 tools/diff.py a.png b.png    # pixel diff (used to prove Standard == v4)
+    m7.bench(n, forceBake)               # (devtools) ms/frame over n frames; forceBake=true rebakes shadows every frame
     python3 tools/maskdiff.py old.png new.png mask.png  # changed pixels outside water (Standard v6 vs v7 check)
 
-URL params (debug): `?fx=0|1` graphics Standard/HQ, `?edge=0|1|2` edges Pixel/Mjuka/Skarpa, `?tod=day|eve|cyc|<hours>` HQ sun, `?area=` internal pixel budget, `?v=0|1|2` chase / first person / top-down, `?z=1.5` zoom, `?r=3.14` camera yaw offset, `?pt=0.4` pitch, `?p=75,65` teleport, `?t=40` cloud time offset.
+URL params (debug): `?fx=0|1` graphics Standard/HQ, `?edge=0|1|2` edges Pixel/Mjuka/Skarpa, `?dither=auto|1|0` dithering, `?tod=day|eve|cyc|<hours>` HQ sun, `?area=` internal pixel budget, `?v=0|1|2` chase / first person / top-down, `?z=1.5` zoom, `?r=3.14` camera yaw offset, `?pt=0.4` pitch, `?p=75,65` teleport, `?t=40` cloud time offset.
 wasm-opt is looked up on PATH, then in node_modules/.bin.
 
 Controls:

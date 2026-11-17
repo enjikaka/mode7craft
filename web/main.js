@@ -36,7 +36,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const touch1 = (x, y, z, id) => {
     dev.queue.writeTexture({ texture: vox, origin: [x, y, z] }, new Uint8Array([id]), {}, [1, 1, 1]);
     dev.queue.writeTexture({ texture: hm, origin: [x, y] }, new Uint8Array(mem(), X.height_ptr() + y * N + x, 1), {}, [1, 1]);
-    edits.set((z * N + y) * N + x, id); save(); lightsT = 0;
+    edits.set((z * N + y) * N + x, id); save(); lightsT = 0; bakeDirty = true;
   };
   // ---------- world files: 'M7C' + version 1 + flags (1 = deflate-raw) + 3 bytes per edit:
   // (index delta << 4 | id), indices sorted. Same bytes go base64url into share links (#w=...).
@@ -64,7 +64,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     for (const [i, id] of m) { edits.set(i, id); X.set_block(i % N, (i / N | 0) % N, i / (N * N) | 0, id); }
     dev.queue.writeTexture({ texture: vox }, new Uint8Array(mem(), X.world_ptr(), N * N * NZ), { bytesPerRow: N, rowsPerImage: N }, [N, N, NZ]);
     dev.queue.writeTexture({ texture: hm }, new Uint8Array(mem(), X.height_ptr(), N * N), { bytesPerRow: N }, [N, N]);
-    save(); lightsT = 0; cz = st[2];
+    save(); lightsT = 0; cz = st[2]; bakeDirty = true;
   };
   const ask = (m) => !edits.size || confirm(`Ers\u00e4tt din v\u00e4rld med den importerade (${m.size} \u00e4ndringar)?`);
   const toast = (m) => { hint.textContent = m; clearTimeout(toast.t); toast.t = setTimeout(setHint, 3500); };
@@ -87,19 +87,25 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const ub = dev.createBuffer({ size: 320, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const tb = dev.createBuffer({ size: 512, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const bb = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  // HQ sun-shadow cache (1 byte per block cell, 128 = unknown -> per-pixel rays until the first bake)
+  const scb = dev.createBuffer({ size: N * N * NZ, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  dev.queue.writeBuffer(scb, 0, new Uint8Array(N * N * NZ).fill(128));
+  let sunD = [0, 0, 1], bakedL = null, bakeDirty = true, bakes = 0;
   const mk = (code, f, e = 'fs', c) => { const m = dev.createShaderModule({ code }); m.getCompilationInfo?.().then((i) => i.messages.forEach((x) => console.warn(x.type, x.lineNum, x.message))); return dev.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: e, constants: c, targets: [{ format: f }] } }); };
   const scene = mk(SCENE_WGSL, 'rgba8unorm'), blit = mk(BLIT_WGSL, fmt);
   // HQ setting: same scene shader with the HQ override on (HDR target) + bloom + tonemap passes.
   // Built and allocated only when HQ is switched on; standard mode never touches any of it.
   const fxq = qs.get('fx'); let hq = fxq != null ? fxq === '1' : localStorage.getItem('m7c-fx') === '1';
   const tq = qs.get('tod'); let tod = tq != null ? (isNaN(+tq) ? tq : +tq) : localStorage.getItem('m7c-tod') || 'day', Q = null, bt, lt, bgB, bgO;
-  const hqP = () => Q ||= { scene: mk(SCENE_WGSL, 'rgba16float', 'fs', { HQ: 1 }), bloom: mk(HQ_WGSL, 'rgba16float', 'fb'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
+  const hqP = () => Q ||= { bake: dev.createComputePipeline({ layout: 'auto', compute: { module: dev.createShaderModule({ code: SCENE_WGSL }), entryPoint: 'bake' } }), scene: mk(SCENE_WGSL, 'rgba16float', 'fs', { HQ: 1 }), bloom: mk(HQ_WGSL, 'rgba16float', 'fb'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
   const bgr = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map((resource, binding) => ({ binding, resource })) });
   // edges: 0 Pixel (classic), 1 Mjuka (edge-smoothing upscale), 2 Skarpa (near-native rays, art-size texels)
   const eq = qs.get('edge'); let edge = +(eq ?? localStorage.getItem('m7c-edge') ?? 0) % 3 || 0, art = 0;
   const area0 = () => edge === 2 ? (hq ? 500000 : 1000000) : hq ? 70000 : 115000;
   let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = +qs.get("area") || area0(), cross = 0;
-  const bset = () => dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, art, edge === 1 ? 1 : 0]));
+  // ordered 4x4 Bayer dithering to a limited palette in the upscale: 'auto' = HQ only, '1' on, '0' off
+  const dq = qs.get('dither'); let dith = dq ?? localStorage.getItem('m7c-dither') ?? 'auto';
+  const bset = () => dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, art, (edge === 1 ? 1 : 0) + (dith === '1' || (dith === 'auto' && hq) ? 2 : 0)]));
   const resize = () => {
     const d = Math.min(devicePixelRatio || 1, 3);
     W = Math.max(1, Math.round(innerWidth * d)); H = Math.max(1, Math.round(innerHeight * d));
@@ -111,7 +117,8 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     rt?.destroy(); bt?.destroy(); lt?.destroy(); bt = lt = null;
     const u = T.RENDER_ATTACHMENT | T.TEXTURE_BINDING;
     rt = dev.createTexture({ size: [iw, ih], format: hq ? 'rgba16float' : 'rgba8unorm', usage: u });
-    sg = bgr(hq ? hqP().scene : scene, [{ buffer: ub }, vox.createView(), hm.createView(), { buffer: tb }]);
+    sg = bgr(hq ? hqP().scene : scene, [{ buffer: ub }, vox.createView(), hm.createView(), { buffer: tb }, { buffer: scb }]);
+    if (hq) Q.bg ||= dev.createBindGroup({ layout: Q.bake.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ub } }, { binding: 1, resource: vox.createView() }, { binding: 4, resource: { buffer: scb } }] });
     if (hq) {
       bt = dev.createTexture({ size: [Math.ceil(iw / 4), Math.ceil(ih / 4)], format: 'rgba16float', usage: u });
       lt = dev.createTexture({ size: [iw, ih], format: 'rgba8unorm', usage: u });
@@ -197,26 +204,27 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const panel = $('#s'); let row = 0, aSel = 0;
   const opened = () => panel.classList.contains('on');
   const syncPanel = () => {
-    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge }[e.dataset.k])));
+    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge, dith }[e.dataset.k])));
     panel.querySelectorAll('p').forEach((e, i) => e.classList.toggle('f', i === row));
-    panel.querySelectorAll('[data-a]').forEach((e, i) => e.classList.toggle('on', row === 3 && i === aSel));
+    panel.querySelectorAll('[data-a]').forEach((e, i) => e.classList.toggle('on', row === 4 && i === aSel));
   };
   const ACT = { exp: exportWorld, imp: () => fileIn.click(), shr: shareLink };
   const runAct = () => ACT[panel.querySelectorAll('[data-a]')[aSel].dataset.a]();
   const setOpt = (k, v) => {
     if (k === 'fx') { if (hq !== (v === '1')) { hq = v === '1'; localStorage.setItem('m7c-fx', +hq); AREA = area0(); slow = 0; resize(); } }
+    else if (k === 'dith') { dith = v; localStorage.setItem('m7c-dither', v); bset(); }
     else if (k === 'edge') { if (edge !== +v) { edge = +v; localStorage.setItem('m7c-edge', v); AREA = area0(); slow = 0; resize(); } }
     else { tod = v; localStorage.setItem('m7c-tod', v); }
     syncPanel();
   };
   const togglePanel = () => { if (panel.classList.toggle('on') && document.pointerLockElement) document.exitPointerLock(); syncPanel(); };
   const stepOpt = (dir) => {
-    if (row === 3) { aSel = (aSel + dir + 3) % 3; return syncPanel(); }
+    if (row === 4) { aSel = (aSel + dir + 3) % 3; return syncPanel(); }
     const o = [...panel.querySelectorAll('p')[row].querySelectorAll('i')], i = o.findIndex((e) => e.classList.contains('on')), e = o[(i + dir + o.length) % o.length]; setOpt(e.dataset.k, e.dataset.v);
   };
-  const moveRow = (dir) => { row = (row + dir + 4) % 4; syncPanel(); };
-  const enter = () => (row === 3 ? runAct() : stepOpt(1));
-  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = ['fx', 'tod', 'edge'].indexOf(d.k); setOpt(d.k, d.v); } if (d.a) { row = 3; aSel = Object.keys(ACT).indexOf(d.a); syncPanel(); ACT[d.a](); } });
+  const moveRow = (dir) => { row = (row + dir + 5) % 5; syncPanel(); };
+  const enter = () => (row === 4 ? runAct() : stepOpt(1));
+  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = ['fx', 'tod', 'edge', 'dith'].indexOf(d.k); setOpt(d.k, d.v); } if (d.a) { row = 4; aSel = Object.keys(ACT).indexOf(d.a); syncPanel(); ACT[d.a](); } });
   $('#g').addEventListener('click', togglePanel);
   for (const el of [panel, $('#g')]) el.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
   syncPanel();
@@ -345,15 +353,20 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   };
   cz = st[2];
   const pass = (enc, v, pl, g) => { const p = enc.beginRenderPass({ colorAttachments: [{ view: v.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] }); p.setPipeline(pl); p.setBindGroup(0, g); p.draw(3); p.end(); };
-  const draw = () => {
+  const draw = (fb) => {
     const enc = dev.createCommandEncoder();
+    // re-bake the sun-shadow cache only when the sun has moved > ~0.4 deg or the world changed
+    if (hq && (fb || bakeDirty || !bakedL || (sunD[0] * bakedL[0] + sunD[1] * bakedL[1] + sunD[2] * bakedL[2]) / Math.hypot(...sunD) / Math.hypot(...bakedL) < 0.999976)) {
+      const c = enc.beginComputePass(); c.setPipeline(Q.bake); c.setBindGroup(0, Q.bg); c.dispatchWorkgroups(N * N * NZ / 256); c.end();
+      bakedL = sunD; bakeDirty = false; bakes++;
+    }
     pass(enc, rt, hq ? Q.scene : scene, sg);
     if (hq) { pass(enc, bt, Q.bloom, bgB); pass(enc, lt, Q.out, bgO); }
     pass(enc, ctx.getCurrentTexture(), blit, bg);
     dev.queue.submit([enc.finish()]);
   };
   // test hook: mean GPU frame time (ms) over n frames, each awaited to completion
-  const bench = async (n) => { await dev.queue.onSubmittedWorkDone(); const t = Date.now(); for (let i = 0; i < n; i++) { draw(); await dev.queue.onSubmittedWorkDone(); } return { ms: (Date.now() - t) / n, iw, ih, hq }; };
+  const bench = async (n, fb) => { await dev.queue.onSubmittedWorkDone(); const t = Date.now(); for (let i = 0; i < n; i++) { draw(fb); await dev.queue.onSubmittedWorkDone(); } return { ms: (Date.now() - t) / n, iw, ih, hq }; };
   const frame = (now) => {
     const dt = Math.min(0.05, (now - last) / 1000); last = now;
     let mx = 0, my = 0, jump = jumpQ; jumpQ = false;
@@ -406,7 +419,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     U.set([iw, ih, now / 1000 + t0, tanV, ...cam.o, V.fog, ...F, far, ...R, iw / ih, ...Up, 0, st[0], st[1], st[2], 0, st[4], st[5], st[6], st[7], V.fps ? 1 : 0, 0, 0, 0]);
     if (hl) U.set([...hl.b, 1], 32);
     U[39] = edge === 1 ? -1 : art;
-    if (hq) { const [d, c, sky, w] = sun(now / 1000 + t0); U.set(sky, 29); U.set([...d, 0, ...c, w], 72); }
+    if (hq) { const [d, c, sky, w] = sun(now / 1000 + t0); U.set(sky, 29); U.set([...d, 0, ...c, w], 72); sunD = d; }
     // torch lights: re-pick the nearest 32 every ~0.3 s (or after an edit), flicker per frame
     if ((lightsT -= dt) <= 0 || !dt) {
       lightsT = 0.3; lights = [];
@@ -425,7 +438,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     if (acc > 1) { if (acc / frames > 0.022 && AREA > (hq ? 25000 : 45000)) { if (++slow >= 2) { AREA *= 0.75; resize(); slow = 0; } } else slow = 0; acc = 0; frames = 0; }
     requestAnimationFrame(frame);
   };
-  window.m7 = { act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get view() { return view; } }; // handy for tests
+  window.m7 = { act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; } }; // handy for tests
   // shared world link (#w=...): load it, then drop the hash so later local edits stay local
   const hw = location.hash.match(/^#w=([\w-]+)/);
   if (hw) { history.replaceState(null, '', location.pathname + location.search); try { await importBytes(unb64(hw[1])); } catch { toast('Ogiltig l\u00e4nk'); } }
