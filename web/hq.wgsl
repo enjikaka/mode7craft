@@ -21,7 +21,7 @@ struct V { @builtin(position) p: vec4f };
 fn aces(x: vec3f) -> vec3f { return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.), vec3f(1.)); }
 @fragment fn fo(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let ip = vec2i(fc.xy); let ds = vec2f(textureDimensions(src));
-  var c = textureLoad(src, ip, 0).rgb;
+  let c4 = textureLoad(src, ip, 0); var c = c4.rgb;
   // pixel-quantised bloom lookup (keeps the glow blocky like the rest), tent of 5 bilinear taps
   let uv = (vec2f(ip) + .5) / ds; let o = 6. / ds; var b = textureSampleLevel(blm, sm, uv, 0.).rgb * 2.;
   b += textureSampleLevel(blm, sm, uv + vec2f(o.x, o.y), 0.).rgb + textureSampleLevel(blm, sm, uv - vec2f(o.x, o.y), 0.).rgb;
@@ -33,5 +33,5 @@ fn aces(x: vec3f) -> vec3f { return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x
   // hue-preserving ACES on the max channel keeps the saturated palette; very hot pixels go white
   c = (c + b * 0.5) * 0.85; let m = max(max(c.r, c.g), max(c.b, 1e-4)); let tm = aces(vec3f(m)).x;
   c = sqrt(mix(c * (tm / m), vec3f(tm), smoothstep(1., 6., m)));
-  return vec4f(c, 1.);
+  return vec4f(c, c4.a);   // alpha = surface id for the 'Mjuka kanter' upscale (1 otherwise)
 }

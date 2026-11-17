@@ -95,12 +95,18 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const tq = qs.get('tod'); let tod = tq != null ? (isNaN(+tq) ? tq : +tq) : localStorage.getItem('m7c-tod') || 'day', Q = null, bt, lt, bgB, bgO;
   const hqP = () => Q ||= { scene: mk(SCENE_WGSL, 'rgba16float', 'fs', { HQ: 1 }), bloom: mk(HQ_WGSL, 'rgba16float', 'fb'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
   const bgr = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map((resource, binding) => ({ binding, resource })) });
-  let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = +qs.get("area") || (hq ? 70000 : 115000), cross = 0;
+  // edges: 0 Pixel (classic), 1 Mjuka (edge-smoothing upscale), 2 Skarpa (near-native rays, art-size texels)
+  const eq = qs.get('edge'); let edge = +(eq ?? localStorage.getItem('m7c-edge') ?? 0) % 3 || 0, art = 0;
+  const area0 = () => edge === 2 ? (hq ? 500000 : 1000000) : hq ? 70000 : 115000;
+  let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = +qs.get("area") || area0(), cross = 0;
+  const bset = () => dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, art, edge === 1 ? 1 : 0]));
   const resize = () => {
     const d = Math.min(devicePixelRatio || 1, 3);
     W = Math.max(1, Math.round(innerWidth * d)); H = Math.max(1, Math.round(innerHeight * d));
     cv.width = W; cv.height = H;
     px = Math.max(1, Math.round(Math.sqrt(W * H / AREA)));
+    // Skarpa: fractional scale (up to native, capped by the pixel budget); art = the classic pixel size in internal pixels
+    if (edge === 2) { px = Math.max(1, Math.sqrt(W * H / AREA)); art = Math.max(1, Math.round(Math.sqrt(W * H / (hq ? 70000 : 115000)))) / px; } else art = 0;
     iw = Math.ceil(W / px); ih = Math.ceil(H / px);
     rt?.destroy(); bt?.destroy(); lt?.destroy(); bt = lt = null;
     const u = T.RENDER_ATTACHMENT | T.TEXTURE_BINDING;
@@ -112,7 +118,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
       bgB = bgr(Q.bloom, [rt.createView()]); bgO = bgr(Q.out, [rt.createView(), bt.createView(), Q.sm]);
     }
     bg = bgr(blit, [(lt || rt).createView(), { buffer: bb }]);
-    dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, 0, 0]));
+    bset();
   };
   addEventListener('resize', resize); resize();
 
@@ -187,29 +193,30 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     if (!VIEWS[view].fps && document.pointerLockElement) document.exitPointerLock();
   };
 
-  // ---------- settings panel: Grafik Standard/HQ, Tid (HQ sun) ----------
+  // ---------- settings panel: Grafik Standard/HQ, Tid (HQ sun), Kanter, Värld (actions) ----------
   const panel = $('#s'); let row = 0, aSel = 0;
   const opened = () => panel.classList.contains('on');
   const syncPanel = () => {
-    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String(e.dataset.k === 'fx' ? +hq : tod)));
+    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge }[e.dataset.k])));
     panel.querySelectorAll('p').forEach((e, i) => e.classList.toggle('f', i === row));
-    panel.querySelectorAll('[data-a]').forEach((e, i) => e.classList.toggle('on', row === 2 && i === aSel));
+    panel.querySelectorAll('[data-a]').forEach((e, i) => e.classList.toggle('on', row === 3 && i === aSel));
   };
   const ACT = { exp: exportWorld, imp: () => fileIn.click(), shr: shareLink };
   const runAct = () => ACT[panel.querySelectorAll('[data-a]')[aSel].dataset.a]();
   const setOpt = (k, v) => {
-    if (k === 'fx') { if (hq !== (v === '1')) { hq = v === '1'; localStorage.setItem('m7c-fx', +hq); AREA = hq ? 70000 : 115000; slow = 0; resize(); } }
+    if (k === 'fx') { if (hq !== (v === '1')) { hq = v === '1'; localStorage.setItem('m7c-fx', +hq); AREA = area0(); slow = 0; resize(); } }
+    else if (k === 'edge') { if (edge !== +v) { edge = +v; localStorage.setItem('m7c-edge', v); AREA = area0(); slow = 0; resize(); } }
     else { tod = v; localStorage.setItem('m7c-tod', v); }
     syncPanel();
   };
   const togglePanel = () => { if (panel.classList.toggle('on') && document.pointerLockElement) document.exitPointerLock(); syncPanel(); };
   const stepOpt = (dir) => {
-    if (row === 2) { aSel = (aSel + dir + 3) % 3; return syncPanel(); }
+    if (row === 3) { aSel = (aSel + dir + 3) % 3; return syncPanel(); }
     const o = [...panel.querySelectorAll('p')[row].querySelectorAll('i')], i = o.findIndex((e) => e.classList.contains('on')), e = o[(i + dir + o.length) % o.length]; setOpt(e.dataset.k, e.dataset.v);
   };
-  const moveRow = (dir) => { row = (row + dir + 3) % 3; syncPanel(); };
-  const enter = () => (row === 2 ? runAct() : stepOpt(1));
-  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = d.k === 'fx' ? 0 : 1; setOpt(d.k, d.v); } if (d.a) { row = 2; aSel = Object.keys(ACT).indexOf(d.a); syncPanel(); ACT[d.a](); } });
+  const moveRow = (dir) => { row = (row + dir + 4) % 4; syncPanel(); };
+  const enter = () => (row === 3 ? runAct() : stepOpt(1));
+  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = ['fx', 'tod', 'edge'].indexOf(d.k); setOpt(d.k, d.v); } if (d.a) { row = 3; aSel = Object.keys(ACT).indexOf(d.a); syncPanel(); ACT[d.a](); } });
   $('#g').addEventListener('click', togglePanel);
   for (const el of [panel, $('#g')]) el.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
   syncPanel();
@@ -398,6 +405,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     U.fill(0);
     U.set([iw, ih, now / 1000 + t0, tanV, ...cam.o, V.fog, ...F, far, ...R, iw / ih, ...Up, 0, st[0], st[1], st[2], 0, st[4], st[5], st[6], st[7], V.fps ? 1 : 0, 0, 0, 0]);
     if (hl) U.set([...hl.b, 1], 32);
+    U[39] = edge === 1 ? -1 : art;
     if (hq) { const [d, c, sky, w] = sun(now / 1000 + t0); U.set(sky, 29); U.set([...d, 0, ...c, w], 72); }
     // torch lights: re-pick the nearest 32 every ~0.3 s (or after an edit), flicker per frame
     if ((lightsT -= dt) <= 0 || !dt) {
@@ -409,7 +417,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     U[38] = lights.length; lights.forEach((l, i) => TLB.set([...l, 0.85 + 0.15 * Math.sin(tf * 13 + i * 1.7) * Math.sin(tf * 7.3 + i)], i * 4));
     if (lights.length) dev.queue.writeBuffer(tb, 0, TLB, 0, lights.length * 4);
     if (parts.length) { U.set([partId, 1], 36); parts.forEach((q, i) => U.set([...q.p, q.life > 0 ? 0.07 + 0.08 * Math.min(1, q.life * 2) : 0], 40 + i * 4)); }
-    if ((V.fps | 0) !== cross) { cross = V.fps | 0; dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, 0, 0])); }
+    if ((V.fps | 0) !== cross) { cross = V.fps | 0; bset(); }
     dev.queue.writeBuffer(ub, 0, U);
     draw();
     // adaptive resolution: drop internal pixels if we can't hold ~45fps

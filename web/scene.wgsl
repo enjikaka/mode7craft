@@ -6,7 +6,7 @@ struct V { @builtin(position) p: vec4f };
   var o: V; let x = f32((i << 1u) & 2u); let y = f32(i & 2u);
   o.p = vec4f(x * 2. - 1., 1. - y * 2., 0., 1.); return o;
 }
-@group(0) @binding(0) var<uniform> U: array<vec4f, 20>;   // U[9].z = torch count
+@group(0) @binding(0) var<uniform> U: array<vec4f, 20>;   // U[9].z = torch count, U[9].w = art-pixel scale ('Skarpa kanter'; 0 = off, -1 = write surface ids for 'Mjuka kanter')
 @group(0) @binding(1) var vox: texture_3d<u32>;
 @group(0) @binding(2) var hm: texture_2d<u32>;
 @group(0) @binding(3) var<uniform> TL: array<vec4f, 32>;   // nearest torches: xyz + flicker (own buffer: keeps U small)
@@ -325,7 +325,7 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
         if (hit) { a = 0.5; }
         a = min(a, ceil(smoothstep(0.1, 0.45, t / length(pc - o)) * 4.) / 4.);
       }
-      if (bayer4(vec2i(floor(fc.xy))) < a) { ca = 1.; ct = t; }
+      if (bayer4(vec2i(floor(fc.xy / max(U[9].w, 1.)))) < a) { ca = 1.; ct = t; }   // dither cells stay art-pixel sized
       break;
     }
   }
@@ -354,12 +354,12 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
     let r = slab(o, sinv(d), d, b0, b0 + vec3f(0.25, 0.25, 0.8125), &tn);
     if (r.x <= r.y && r.x > 0. && r.x < hb.t) { hb.t = r.x; hb.id = 8u; hb.n = tn; part = false; }
   }
-  var col: vec3f; var tt = hb.t;
+  var col: vec3f; var tt = hb.t; var gid = 251.;   // surface id (sky 251, water 250, planes 0..239, avatar 253)
   if (hb.id == 0u && ca > 0.5 && ct < tw) { if (HQ) { return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
   if (hb.id == 0u) {
     if (tw > far) { col = sky(d); tt = 0.; if (HQ) { col = hqSky(d); tt = far; } }
     else {
-      tt = tw;
+      tt = tw; gid = 250.;
       let p = o + d * tw;
       if (HQ) { col = hqWater(p, d); }
       else { col = water(d, p, shadow(vec3f((floor(p.xy * S) + .5) / S, ZW)), true).c; if (U[9].z > 0.) { col += col * torchL(p, vec3f(0., 0., 1.), false) * 0.6; } }
@@ -369,6 +369,10 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
     let ht = vec3i(floor((p - n * 0.002) * S));          // texel inside the hit voxel, robust on faces
     let face = select(select(2, 1, abs(n.x) > 0.5), 0, n.z > 0.5);
     let isLog = hb.id == 5u && !part;
+    // coplanar faces share an id, so only real geometry edges (silhouettes, steps, shore) get smoothed
+    gid = f32((u32(face + select(0, 3, dot(n, vec3f(1.)) < 0.)) * 41u + u32(round(abs(dot(p, n))) + 64.) * 7u) % 240u);
+    if (isLog) { gid = f32(hh(u32(floor(p.x)) * 977u + u32(floor(p.y))) % 240u); }
+    if (hb.id >= 8u || part) { gid = select(248., 253., hb.id >= 10u); }
     col = select(matCol(hb.id, ht, face), birch(p, n), isLog); let base0 = col;
     var lit = 1.;
     if (HQ) { col = hqShade(p, n, ht, hb.id, isLog, part, col); }
@@ -404,13 +408,14 @@ fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z *
         let f = p - vec3f(cell); let e3 = min(f, 1. - f); var e = 1.;
         if (abs(n.x) < 0.5) { e = min(e, e3.x); } if (abs(n.y) < 0.5) { e = min(e, e3.y); } if (abs(n.z) < 0.5) { e = min(e, e3.z); }
         let pix = hb.t * 2. * U[0].w / U[0].y;
-        if (e < max(0.06, pix * 1.2)) { col = vec3f(0.07, 0.07, 0.1); } else { col = select(mix(col, vec3f(1.), 0.18), col * 1.5 + 0.02, HQ); }
+        if (e < max(0.06, pix * 1.2 * max(U[9].w, 1.))) { col = vec3f(0.07, 0.07, 0.1); } else { col = select(mix(col, vec3f(1.), 0.18), col * 1.5 + 0.02, HQ); }
       }
     }
   }
-  if (HQ) { return vec4f(hqAtmo(o, d, tt, far, fogOn, col, fc.xy), 1.); }
+  let ga = select(1., gid / 255., U[9].w < 0.);
+  if (HQ) { return vec4f(hqAtmo(o, d, tt, far, fogOn, col, fc.xy), ga); }
   col = mix(col, FOG, fogOn * smoothstep(far * 0.35, far, tt));
-  return vec4f(col, 1.);
+  return vec4f(col, ga);
 }
 
 // warm point lights from the nearest torches (list filled by JS). HQ adds an occlusion ray.

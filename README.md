@@ -1,4 +1,4 @@
-# Mode7craft v7
+# Mode7craft v8
 
 ![Mode7craft](docs/screenshot.png)
 
@@ -8,6 +8,9 @@ A tiny Minecraft-style island rendered SNES Mode 7 / sprite-stacking style: no m
 - Block editing: only the touched voxel and heightmap texel are re-uploaded to the GPU. Hotbar: grass, dirt, stone, sand, birch log, leaves, planks, torch. Edits persist in localStorage (`m7c-edits-1`); `?reset` clears them.
 - Birch logs are analytic ray-cylinder hits (they cast round shadows too) with procedural bark: off-white, dark dashes and sparse knots.
 - `web/scene.wgsl`: one full-screen fragment shader, no meshes. Terrain and trees use an exact voxel DDA (Amanatides-Woo) over the block grid. The sprite-stacked avatar uses a texel DDA in its own bounding box. Clouds are stacked 2D slices. The whole cloud cluster that hides the avatar, or that it stands under, is drawn at ~50% with a screen-stable 4x4 Bayer dither; clouds near the camera step down in dither levels. Views: chase, first person (with a pixel crosshair drawn in the blit pass) and top-down. V, Y or VIEW cycles them. 8x8 procedural pixel textures, shadows, water/foam and fog.
+- Edges (v8, settings row `Kanter`, saved as `m7c-edge`, `?edge=0|1|2`). The default `Pixel` is the classic look and is pixel-identical to v7.
+  - `Mjuka` (cheap): edge-aware upscale in `blit.wgsl`. The scene writes a surface id into alpha (coplanar faces share one), and the blit applies a Scale2x-style corner rule with an anti-aliased 45-degree cut only where real geometry meets. Staircases on silhouettes, block steps and the shore become smooth diagonals; texture texels, dithering and water bands stay pixel-sharp. It costs 5 texel loads per screen pixel and nothing extra in the scene. Works in Standard and HQ.
+  - `Skarpa` (native-res): rays are traced at up to native resolution. The budget is 1.0M internal pixels in Standard and 0.5M in HQ, DPR-aware, with a fractional scale. Because all shading already reads the 8x8 texel grid (textures, shadow probes, water texels, cloud cells), surfaces keep their big SNES texels while silhouettes, the shoreline, water-band edges and the avatar become crisp at screen resolution. Cloud dither, the target outline and the crosshair are scaled back to the classic pixel size (`U[9].w` / blit `B.z`). Dynamic resolution still steps the budget down by 0.75 until about 45 fps holds, so weak phones end up near the classic resolution.
 - Layered water (v7, Standard and HQ), after asynkimo's "Basic water tile vs Layered water":
   - Stepped depth bands, from semi-transparent shallow teal over the sand to opaque deep blue-teal. Depth comes from the sea-floor height, smoothed over block columns and jittered per 2x2 texels, so band edges are pixel-art steps that follow the slope.
   - The sea floor slopes at about half the land slope (generator change below sea level only), so there are wide shallow shelves.
@@ -27,7 +30,7 @@ A tiny Minecraft-style island rendered SNES Mode 7 / sprite-stacking style: no m
   - Opening a `#w=` link loads the world, removes the hash and saves the world to localStorage.
   - File format v1: `M7C` + version byte (1) + flags byte (1 = deflate-raw), then the deflate-raw (CompressionStream) payload, which is 3 bytes per edit: `(index delta << 4) | block id`, big-endian, with indices sorted. A typical house with torches (~80 edits) is about 90 bytes.
 - `web/blit.wgsl`: nearest-neighbour integer upscale of the low-res target.
-- Settings (gear button top-right, `G`, or Xbox Start/Menu): `Grafik: Standard / HQ` and `Tid (HQ): Dag / Kväll / Cykel`, saved in localStorage (`m7c-fx`, `m7c-tod`). Standard is the default and renders pixel-identically to v4. In the open panel, arrow keys / D-pad pick a row and change the value, On the `Värld` row, Enter / A runs the selected action. Esc / G / B / Start close the panel.
+- Settings (gear button top-right, `G`, or Xbox Start/Menu): `Grafik: Standard / HQ` and `Tid (HQ): Dag / Kväll / Cykel`, saved in localStorage (`m7c-fx`, `m7c-tod`). Standard is the default and renders pixel-identically to v4. In the open panel (rows Grafik, Tid, Kanter, Värld), arrow keys / D-pad pick a row and change the value. On the `Värld` row, Enter / A runs the selected action. Esc / G / B / Start close the panel.
 - HQ ("AAA shaders"): the same `scene.wgsl` built a second time with the pipeline-overridable constant `HQ=true`, so the standard pipeline compiles none of the HQ code. HQ lighting:
   - per-voxel AO
   - soft sun shadows (3-ray cone, sharp at contact), with translucent cloud shadows
@@ -49,7 +52,7 @@ A tiny Minecraft-style island rendered SNES Mode 7 / sprite-stacking style: no m
     python3 tools/diff.py a.png b.png    # pixel diff (used to prove Standard == v4)
     python3 tools/maskdiff.py old.png new.png mask.png  # changed pixels outside water (Standard v6 vs v7 check)
 
-URL params (debug): `?fx=0|1` graphics Standard/HQ, `?tod=day|eve|cyc|<hours>` HQ sun, `?area=` internal pixel budget, `?v=0|1|2` chase / first person / top-down, `?z=1.5` zoom, `?r=3.14` camera yaw offset, `?pt=0.4` pitch, `?p=75,65` teleport, `?t=40` cloud time offset.
+URL params (debug): `?fx=0|1` graphics Standard/HQ, `?edge=0|1|2` edges Pixel/Mjuka/Skarpa, `?tod=day|eve|cyc|<hours>` HQ sun, `?area=` internal pixel budget, `?v=0|1|2` chase / first person / top-down, `?z=1.5` zoom, `?r=3.14` camera yaw offset, `?pt=0.4` pitch, `?p=75,65` teleport, `?t=40` cloud time offset.
 wasm-opt is looked up on PATH, then in node_modules/.bin.
 
 Controls:
