@@ -1,6 +1,8 @@
-# Mode7craft v10
+# Mode7craft v10.1
 
 ![Mode7craft](docs/screenshot.png)
+
+v10.1 (Safari hotfix): v10 drew a black screen on iOS Safari. Safari/WebKit before mid-2026 (fixed in WebKit 2026-06-23, "Render pipeline silently produces no draw output when given pipeline-overridable constants that its vertex/fragment entry points don't use") silently drops every draw of a pipeline that gets a `constants` entry one of its stages does not use, and v10 started passing `{HQ, LEAF}` to the vertex stage too (`vs` uses neither), so every mode was black. The renderer no longer uses pipeline `constants` at all: `spec()` rewrites `override X = d;` to `const X = v;` per variant (same values, pixel-identical output). Also new: a visible red error strip for GPU validation/WGSL/JS errors, a `device.lost` message, per-pipeline error scopes with automatic in-session fallback (failed splats -> off, failed HQ -> Standard, failed porous leaves -> Block), a one-time black-frame probe per (HQ, leaves, edges) combination that steps down HQ -> Standard -> Block -> Pixel if the scene target comes back pure black, a try/catch around each frame, and limit guards (no HQ if `maxStorageBuffersInFragmentStage` is 0, no splats if `maxStorageBuffersInVertexStage` is 0). Fallbacks are never saved.
 
 Defaults (for users with no saved settings): **Grafik HQ, Tid Cykel, Kanter Skarpa, Dither Av, Löv Auto** (Löv+splats in HQ, Löv in Standard). Saved settings (localStorage `m7c-fx`, `m7c-tod`, `m7c-edge`, `m7c-dither`) win over the defaults, and URL params win over both. `?fx=0&edge=0&leaf=0` gives the classic Standard look: pixel-identical to v9 and to v8 except for the sun glitter on water.
 

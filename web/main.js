@@ -1,15 +1,27 @@
 // Mode7craft front-end: WebGPU renderer + input. World + game logic live in g.wasm.
 const $ = (s) => document.querySelector(s);
 const cv = $('#c'), hint = $('#h');
-const fail = (m) => { $('#e').textContent = m; $('#e').style.display = 'flex'; };
+const fail = (m) => { if ($('#e').style.display === 'flex') return; $('#e').textContent = m; $('#e').style.display = 'flex'; };
+// visible (non-fatal) GPU/JS error strip, so a problem never hides behind a silent black canvas
+const warn = (m) => {
+  let b = $('#w'); if (!b) { b = document.createElement('div'); b.id = 'w'; b.style.cssText = 'position:fixed;left:8px;right:8px;top:calc(8px + env(safe-area-inset-top));z-index:8;background:rgba(110,16,16,.88);color:#fff;font:700 11px/1.4 ui-monospace,Menlo,monospace;padding:6px 10px;white-space:pre-wrap;word-break:break-word;pointer-events:none'; document.body.append(b); }
+  m = String(m).split('\n')[0].slice(0, 200); const L = b.textContent ? b.textContent.split('\n') : [];
+  if (!L.includes(m)) b.textContent = [...L, m].slice(-4).join('\n');
+  clearTimeout(warn.t); warn.t = setTimeout(() => b.remove(), 20000);
+};
+addEventListener('error', (e) => warn('JS: ' + e.message));
+addEventListener('unhandledrejection', (e) => warn('JS: ' + (e.reason?.message ?? e.reason)));
 const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: Math.sin, mcos: Math.cos, msqrt: Math.sqrt } });
 (async () => {
   if (!navigator.gpu) return fail('WebGPU is not available in this browser. Try Chrome/Edge 113+, Safari 26+ (iOS 26), or enable WebGPU in your browser flags.');
   const ad = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!ad) return fail('WebGPU is supported but no GPU adapter was found.');
   const dev = await ad.requestDevice();
-  dev.addEventListener('uncapturederror', (e) => console.error(e.error.message));
-  dev.lost.then((i) => fail('GPU device lost: ' + i.message));
+  dev.addEventListener('uncapturederror', (e) => { console.error(e.error.message); warn('GPU: ' + e.error.message); });
+  dev.lost.then((i) => fail('GPU device lost (' + i.reason + '): ' + i.message + ' \u2013 ladda om sidan.'));
+  // adapters that cannot use storage buffers in a stage (WebGPU compat-style limits): HQ needs them in the
+  // fragment stage (sun-shadow cache), leaf splats in the vertex stage. Undefined (e.g. Safari) = core = fine.
+  const noFS = dev.limits.maxStorageBuffersInFragmentStage === 0, noVS = dev.limits.maxStorageBuffersInVertexStage === 0;
   const { instance } = await wasmP; const X = instance.exports;
   X.gen(1337);
   const mem = () => X.memory.buffer;
@@ -105,16 +117,33 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     dev.queue.writeBuffer(lfb, 0, a); leafDirty = false;
   };
   let sunD = [0, 0, 1], bakedL = null, bakeDirty = true, bakes = 0;
-  const mk = (code, f, e = 'fs', c, ds, v = 'vs') => { const m = dev.createShaderModule({ code }); m.getCompilationInfo?.().then((i) => i.messages.forEach((x) => console.warn(x.type, x.lineNum, x.message))); return dev.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: v, constants: c }, fragment: { module: m, entryPoint: e, constants: c, targets: [{ format: f }] }, depthStencil: ds && { format: 'depth32float', depthWriteEnabled: true, depthCompare: ds } }); };
+  // v10.1: no pipeline-overridable `constants` at all. Safari/WebKit before mid-2026 silently drops every draw of a
+  // render pipeline that gets a constant one of its entry points does not use (v10 passed them to the vertex stage
+  // too, and 'vs' uses none -> black screen on iOS 26). Instead each variant bakes its values into the WGSL source:
+  // `override X = d;` becomes `const X = v;` (same value, same code), one shader module per variant.
+  const spec = (code, c = {}) => code.replace(/override\s+(\w+)\s*=\s*([^;]+);/g, (_, k, d) => `const ${k}=${k in c ? (/^(true|false)$/.test(d.trim()) ? String(!!c[k]) : c[k]) : d};`);
+  const mods = new Map();
+  const mod = (code) => {
+    if (!mods.has(code)) { const m = dev.createShaderModule({ code }); mods.set(code, m); m.getCompilationInfo?.().then((i) => i.messages.forEach((x) => { console.warn(x.type, x.lineNum, x.message); if (x.type === 'error') warn(`WGSL ${x.lineNum}:${x.linePos} ${x.message}`); })); }
+    return mods.get(code);
+  };
+  // pipeline errors are caught per pipeline (validation + internal scopes); tag says what to switch off if it fails
+  let splatOff = false, hqOff = noFS, leafOff = false;
+  const guard = (tag, mkp) => {
+    dev.pushErrorScope('internal'); dev.pushErrorScope('validation');
+    const p = mkp(); const chk = (er) => er && fallback(tag, er.message);
+    dev.popErrorScope().then(chk); dev.popErrorScope().then(chk); return p;
+  };
+  const mk = (code, f, e = 'fs', c, ds, v = 'vs', tag = 'base') => guard(tag, () => { const m = mod(spec(code, c)); return dev.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: v }, fragment: { module: m, entryPoint: e, targets: [{ format: f }] }, depthStencil: ds ? { format: 'depth32float', depthWriteEnabled: true, depthCompare: ds } : undefined }); });
   const blit = mk(BLIT_WGSL, fmt), scP = {};
-  // scene pipelines per (HQ, porous leaves): LEAF is a pipeline constant, so 'Block' compiles the exact old code
-  const sceneP = (h, l) => scP[+h + 2 * l] ||= h ? mk(SCENE_WGSL, 'rgba16float', 'fsh', { HQ: 1, LEAF: l }, 'always') : mk(SCENE_WGSL, 'rgba8unorm', 'fs', { LEAF: l });
+  // scene pipelines per (HQ, porous leaves): LEAF is a baked constant, so 'Block' compiles the exact old code
+  const sceneP = (h, l) => scP[+h + 2 * l] ||= h ? mk(SCENE_WGSL, 'rgba16float', 'fsh', { HQ: 1, LEAF: l }, 'always', 'vs', 'hq') : mk(SCENE_WGSL, 'rgba8unorm', 'fs', { LEAF: l }, 0, 'vs', l ? 'leaf' : 'base');
   let SP;
   // HQ setting: same scene shader with the HQ override on (HDR target) + bloom + tonemap passes.
   // Built and allocated only when HQ is switched on; standard mode never touches any of it.
-  const fxq = qs.get('fx'); let hq = (fxq ?? localStorage.getItem('m7c-fx') ?? '1') === '1';
+  const fxq = qs.get('fx'); let hq = !hqOff && (fxq ?? localStorage.getItem('m7c-fx') ?? '1') === '1';
   const tq = qs.get('tod'); let tod = tq != null ? (isNaN(+tq) ? tq : +tq) : localStorage.getItem('m7c-tod') || 'cyc', Q = null, bt, lt, bgB, bgO;
-  const hqP = () => Q ||= { bake: dev.createComputePipeline({ layout: 'auto', compute: { module: dev.createShaderModule({ code: SCENE_WGSL }), entryPoint: 'bake' } }), splat: mk(SCENE_WGSL, 'rgba16float', 'sfs', { HQ: 1 }, 'less', 'svs'), bloom: mk(HQ_WGSL, 'rgba16float', 'fb'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
+  const hqP = () => Q ||= { bake: guard('hq', () => dev.createComputePipeline({ layout: 'auto', compute: { module: mod(spec(SCENE_WGSL)), entryPoint: 'bake' } })), splat: mk(SCENE_WGSL, 'rgba16float', 'sfs', { HQ: 1 }, 'less', 'svs', 'splat'), bloom: mk(HQ_WGSL, 'rgba16float', 'fb', 0, 0, 'vs', 'hq'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo', 0, 0, 'vs', 'hq'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
   const bgr = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map((resource, binding) => ({ binding, resource })) });
   // edges: 0 Pixel (classic), 1 Mjuka (edge-smoothing upscale), 2 Skarpa (near-native rays, art-size texels)
   const eq = qs.get('edge'); let edge = +(eq ?? localStorage.getItem('m7c-edge') ?? 2) % 3 || 0, art = 0;
@@ -127,7 +156,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   // leaves: 0 Block (old solid), 1 Löv (porous leaf sprites), 2 Löv+splats (HQ: + swaying leaf splats); 'auto' = 2 in HQ, 1 in Standard
   const SPLATS = +qs.get('splats') || 24000;   // total splat cap
   const lq = qs.get('leaf'); let leaf = lq ?? localStorage.getItem('m7c-leaf') ?? 'auto';
-  const leafM = () => { const m = leaf === 'auto' ? (hq ? 2 : 1) : +leaf || 0; return hq || m < 2 ? m : 1; };
+  const leafM = () => { const m = leafOff ? 0 : leaf === 'auto' ? (hq ? 2 : 1) : +leaf || 0; return (hq && !splatOff && !noVS) || m < 2 ? m : 1; };
   const splatK = () => Math.max(1, Math.min(8, Math.round(8 * AREA / (+qs.get('area') || area0())), Math.floor(SPLATS / Math.max(nLeaf, 1))));
   const bset = () => dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, art, (edge === 1 ? 1 : 0) + (dith === '1' || (dith === 'auto' && hq) ? 2 : 0)]));
   const resize = () => {
@@ -140,7 +169,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     iw = Math.ceil(W / px); ih = Math.ceil(H / px);
     rt?.destroy(); dt?.destroy(); bt?.destroy(); lt?.destroy(); bt = lt = dt = null;
     const u = T.RENDER_ATTACHMENT | T.TEXTURE_BINDING;
-    rt = dev.createTexture({ size: [iw, ih], format: hq ? 'rgba16float' : 'rgba8unorm', usage: u });
+    rt = dev.createTexture({ size: [iw, ih], format: hq ? 'rgba16float' : 'rgba8unorm', usage: u | T.COPY_SRC });   // COPY_SRC: black-frame probe
     if (hq) hqP(); SP = sceneP(hq, +(leafM() > 0)); sg = bgr(SP, [{ buffer: ub }, vox.createView(), hm.createView(), { buffer: tb }, { buffer: scb }]);
     if (hq) Q.bg ||= dev.createBindGroup({ layout: Q.bake.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ub } }, { binding: 1, resource: vox.createView() }, { binding: 7, resource: { buffer: scb } }] });
     if (hq) {
@@ -230,19 +259,53 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const panel = $('#s'); let row = 0, aSel = 0;
   const opened = () => panel.classList.contains('on');
   const syncPanel = () => {
-    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge, dith, leaf: leaf === 'auto' ? (hq ? 2 : 1) : +leaf }[e.dataset.k])));
+    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge, dith, leaf: leafOff ? 0 : leaf === 'auto' ? (hq ? 2 : 1) : +leaf }[e.dataset.k])));
     panel.querySelectorAll('p').forEach((e, i) => e.classList.toggle('f', i === row));
     panel.querySelectorAll('[data-a]').forEach((e, i) => e.classList.toggle('on', row === 5 && i === aSel));
   };
   const ACT = { exp: exportWorld, imp: () => fileIn.click(), shr: shareLink };
   const runAct = () => ACT[panel.querySelectorAll('[data-a]')[aSel].dataset.a]();
   const setOpt = (k, v) => {
-    if (k === 'fx') { if (hq !== (v === '1')) { hq = v === '1'; localStorage.setItem('m7c-fx', +hq); AREA = area0(); slow = fast = 0; ceil = 1e9; resize(); } }
+    if (k === 'fx') { if (hq !== (v === '1' && !hqOff)) { hq = v === '1' && !hqOff; localStorage.setItem('m7c-fx', +hq); AREA = area0(); slow = fast = 0; ceil = 1e9; resize(); } }
     else if (k === 'leaf') { leaf = v; localStorage.setItem('m7c-leaf', v); resize(); }
     else if (k === 'dith') { dith = v; localStorage.setItem('m7c-dither', v); bset(); }
     else if (k === 'edge') { if (edge !== +v) { edge = +v; localStorage.setItem('m7c-edge', v); AREA = area0(); slow = fast = 0; ceil = 1e9; resize(); } }
     else { tod = v; localStorage.setItem('m7c-tod', v); }
     syncPanel();
+  };
+  // automatic fallback (this session only, nothing saved): a failed pipeline switches off just that feature;
+  // a scene that renders pure black steps down HQ -> Standard -> Block leaves -> Pixel edges
+  const fallback = (tag, why) => setTimeout(() => {
+    console.warn('fallback', tag, why);
+    if (tag === 'black') tag = hq ? 'hq' : leafM() ? 'leaf' : edge ? 'edge' : 'base';
+    if (tag === 'splat' && !splatOff) splatOff = true;
+    else if (tag === 'hq' && !hqOff) { hqOff = true; hq = false; AREA = area0(); slow = fast = 0; ceil = 1e9; }
+    else if (tag === 'leaf' && !leafOff) leafOff = true;
+    else if (tag === 'edge' && edge) { edge = 0; AREA = area0(); slow = fast = 0; ceil = 1e9; }
+    else if (tag === 'base') return fail('Grafiken kunde inte startas (WebGPU): ' + why);
+    else return;
+    warn(`Grafik: ${{ splat: 'l\u00f6vsplats', hq: 'HQ', leaf: 'l\u00f6vm\u00f6nster', edge: 'skarpa kanter' }[tag]} fungerar inte h\u00e4r och st\u00e4ngdes av (${String(why).slice(0, 160)})`);
+    resize(); syncPanel();
+  });
+  // black-frame probe, once per (HQ, leaves, edges) combination: reads 3 short rows of the scene target.
+  // A pipeline that WebKit silently refuses to draw leaves the clear colour (0,0,0) everywhere.
+  const probed = new Set(); let probing = false, pf = 0, drawn = null;
+  const probe = async () => {
+    // skip if the target was re-created after the last draw (dynamic resolution / settings), it is still empty
+    const key = [hq, leafM(), edge].join(); if (probing || probed.has(key) || rt !== drawn) return; probing = true; probed.add(key);
+    try {
+    const h = hq, b = h ? 8 : 4, w = Math.min(iw, 64), x = (iw - w) >> 1, buf = dev.createBuffer({ size: 1536, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = dev.createCommandEncoder();
+    for (let j = 0; j < 3; j++) enc.copyTextureToBuffer({ texture: rt, origin: [x, Math.min(ih - 1, ih * (j + 1) >> 2)] }, { buffer: buf, offset: j * 512, bytesPerRow: 512 }, [w, 1]);
+    dev.queue.submit([enc.finish()]);
+    try {
+      await buf.mapAsync(GPUMapMode.READ); const a = h ? new Uint16Array(buf.getMappedRange()) : new Uint8Array(buf.getMappedRange()); let lit = 0;
+      for (let j = 0; j < 3; j++) for (let i = 0; i < w; i++) { let v = 0; for (let c = 0; c < 3; c++) v |= a[(j * 512 + i * b) / (h ? 2 : 1) + c] & (h ? 0x7fff : 255); lit += !!v; }
+      // a real frame (sky, ground, even night) has colour almost everywhere; a few leaf splats over a black scene do not count
+      buf.unmap(); if (lit < w * 3 / 4 && key === [hq, leafM(), edge].join()) fallback('black', 'svart bild');
+    } catch (e) { console.warn('probe', e); }
+    buf.destroy();
+    } finally { probing = false; }
   };
   const togglePanel = () => { if (panel.classList.toggle('on') && document.pointerLockElement) document.exitPointerLock(); syncPanel(); };
   const stepOpt = (dir) => {
@@ -397,11 +460,17 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     } else pass(enc, rt, SP, sg);
     if (hq) { pass(enc, bt, Q.bloom, bgB); pass(enc, lt, Q.out, bgO); }
     pass(enc, ctx.getCurrentTexture(), blit, bg);
-    dev.queue.submit([enc.finish()]);
+    dev.queue.submit([enc.finish()]); drawn = rt;
   };
   // test hook: mean GPU frame time (ms) over n frames, each awaited to completion
   const bench = async (n, fb) => { await dev.queue.onSubmittedWorkDone(); const t = Date.now(); for (let i = 0; i < n; i++) { draw(fb); await dev.queue.onSubmittedWorkDone(); } return { ms: (Date.now() - t) / n, iw, ih, hq }; };
+  let ferr = 0;
   const frame = (now) => {
+    try { tick(now); if (++pf > 3) probe(); ferr = 0; }
+    catch (e) { console.error(e); warn('Fel i ritningen: ' + e.message); if (++ferr > 60) return fail('Spelet stannade: ' + e.message); }
+    requestAnimationFrame(frame);
+  };
+  const tick = (now) => {
     const rdt = (now - last) / 1000, dt = Math.min(0.05, rdt); last = now;
     let mx = 0, my = 0, jump = jumpQ; jumpQ = false;
     run = keys.has('ShiftLeft') || keys.has('ShiftRight');
@@ -478,7 +547,6 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
       else slow = fast = 0;
       acc = 0; frames = 0;
     }
-    requestAnimationFrame(frame);
   };
   window.m7 = { act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; }, get area() { return AREA; }, get splats() { return leafM() === 2 ? nLeaf * splatK() : 0; }, get leaves() { return nLeaf; } }; // handy for tests
   // shared world link (#w=...): load it, then drop the hash so later local edits stay local
