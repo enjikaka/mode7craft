@@ -1,6 +1,14 @@
-# Mode7craft v11
+# Mode7craft v13
 
 ![Mode7craft](docs/screenshot.png)
+
+v13 adds two looks, both ending in the same palette snap: colours are cut to 15 bits (5-5-5, like the SNES) and looked up in a 32x32x32 table (a 1024x32 rgba8 texture, 128 KB) that holds the nearest of 256 palette colours (23 block/sky/sunset/skin colours x 11 shades, darker shades shifted blue like the game's shadows, plus black/grey/white; red-mean weighted RGB). The GPU builds the table once (`fp` in `web/blit.wgsl`), only when one of the two modes is first used; the default look allocates nothing new and is pixel-identical to v12.
+- Kanter `SS+palett` (`?edge=3`): rays at 2x2 per output pixel (budget 4x Pixel: 460k Standard / 280k HQ internal pixels, dynamic resolution as before), box-filtered to the output grid and snapped to the palette (`fq` in `web/blit.wgsl`). Clean edges without shimmer (idea from @anxuanng).
+- `SNES-läge` (settings row, `?snes=1`, `m7c-snes`): fixed 256x224 internal resolution, the largest integer scale that fits (nearest, black letterbox), 15-bit colour + palette, HDMA-style horizon fog (one value per scanline from where that line's ray meets the ground, colour taken from the sky on the horizon line). Works with Standard and HQ; the Dither setting dithers to the palette. Dynamic resolution is off in this mode. Pointer picking and nametags use the letterboxed rect.
+- A failing palette pipeline switches both off for the session (SNES-läge off, SS+palett -> Skarpa). No pipeline `constants` (v10.1 rule).
+- Build without a Rust toolchain: `KEEPWASM=1 node tools/build.ts` reuses `dist/g.wasm`.
+
+# Mode7craft v11
 
 v11: the island is 256x256 (was 128x128; height stays 16), at the same feature scale, so there is 4x the land, and about twice as many trees.
 - Old saves migrate. Old localStorage edits (`m7c-edits-1`) and old files and links (`M7C` v1) are rebuilt on the old island. The edited area plus 4 blocks of surrounding terrain (all heights) is moved into the centre of the new island (+64,+64: old spawn maps to new spawn) and stored as v2 edits (`m7c-edits-2`). The old key is kept as a backup; `?reset` clears both. File and link format v2 has the same layout with indices for the 256 world. A toast says "Gammal värld flyttad till mitten av nya ön".

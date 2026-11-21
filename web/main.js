@@ -187,10 +187,16 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const hqP = () => Q ||= { bake: guard('hq', () => dev.createComputePipeline({ layout: 'auto', compute: { module: mod(spec(SCENE_WGSL)), entryPoint: 'bake' } })), bloom: mk(HQ_WGSL, 'rgba16float', 'fb', 0, 0, 'vs', 'hq'), out: mk(HQ_WGSL, 'rgba8unorm', 'fo', 0, 0, 'vs', 'hq'), sm: dev.createSampler({ magFilter: 'linear', minFilter: 'linear' }) };
   const bgE = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map(([binding, resource]) => ({ binding, resource })) });
   const bgr = (p, r) => dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: r.map((resource, binding) => ({ binding, resource })) });
-  // edges: 0 Pixel (classic), 1 Mjuka (edge-smoothing upscale), 2 Skarpa (near-native rays, art-size texels)
-  const eq = qs.get('edge'); let edge = +(eq ?? localStorage.getItem('m7c-edge') ?? 2) % 3 || 0, art = 0;
+  // edges: 0 Pixel (classic), 1 Mjuka (edge-smoothing upscale), 2 Skarpa (near-native rays, art-size texels),
+  // 3 SS+palett (v13: rays at 2x2 per classic pixel, box-filtered and snapped to the palette)
+  const eq = qs.get('edge'); let edge = +(eq ?? localStorage.getItem('m7c-edge') ?? 2) % 4 || 0, art = 0;
+  // SNES-läge (v13): fixed 256x224 internal, integer-scaled with letterbox, 15-bit colour, 256-colour palette, HDMA fog
+  const snq = qs.get('snes'); let snes = (snq ?? localStorage.getItem('m7c-snes') ?? '0') === '1', palOff = false, PQ = null, bgQ, VR = [0, 0, 1, 1];
+  const QB = new Float32Array(16), useQ = () => !palOff && (snes || edge === 3);
+  // screen rect of the picture in CSS px (letterboxed in SNES-läge)
+  const vrect = () => snes ? VR : [0, 0, innerWidth, innerHeight];
   // internal-pixel budget: Skarpa starts at 40% of its cap and dynamic resolution climbs while frames are fast
-  const amax = () => edge === 2 ? (hq ? 500000 : 1000000) : hq ? 70000 : 115000;
+  const amax = () => edge === 2 ? (hq ? 500000 : 1000000) : (hq ? 70000 : 115000) * (edge === 3 ? 4 : 1);
   const area0 = () => edge === 2 ? amax() * 0.4 : amax();
   let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = +qs.get("area") || area0(), cross = 0;
   // ordered 4x4 Bayer dithering to a limited palette in the upscale: 'auto' = HQ only, '1' on, '0' off
@@ -200,6 +206,26 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const lq = qs.get('leaf'); let leaf = lq ?? localStorage.getItem('m7c-leaf') ?? '1';
   const leafM = () => leafOff || leaf === '0' ? 0 : 1;
   const bset = () => dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, art, (edge === 1 ? 1 : 0) + (dith === '1' || (dith === 'auto' && hq) ? 2 : 0)]));
+  // v13 palette: 23 block/sky/sunset/skin colours x 11 shades (darker shades shift blue like the game's shadows) + black, grey, white,
+  // all cut to 15 bits; the GPU turns it into the 15-bit -> nearest-colour table once, the first time it is needed
+  const palette = () => {
+    const o = new Float32Array(1024); let i = 0; const q = (v) => Math.round(Math.min(1, Math.max(0, v)) * 31) / 31;
+    for (const h of [0x8fd24a, 0x66b232, 0x448c27, 0x86b83a, 0xa6d24e, 0x8a5a34, 0xd6c983, 0x959e9e, 0xebe7dc, 0xb8915a, 0x7a5230, 0xff9a2e, 0xffd65c, 0x3fa9c9, 0x2b3a8c, 0x8cb8eb, 0xc2dbf0, 0xe0a878, 0xc8443a, 0x9a52c8, 0xf0a088, 0x2a3a60, 0x9aa8cc])
+      for (const b of [0.14, 0.23, 0.33, 0.43, 0.53, 0.63, 0.73, 0.83, 0.93, 1.03, 1.15]) {
+        const t = Math.max(0, (0.8 - b) / 0.64);
+        [h >> 16, (h >> 8) & 255, h & 255].forEach((c, j) => { o[i * 4 + j] = q(c / 255 * b * (1 - t * [0.24, 0.16, 0][j])); }); i++;
+      }
+    for (const v of [0, 0.5, 1]) { o.fill(v, i * 4, i * 4 + 3); i++; }
+    return o;
+  };
+  const palP = () => PQ ||= guard('pal', () => {
+    const fp = mk(BLIT_WGSL, 'rgba8unorm', 'fp', 0, 0, 'vs', 'pal'), p = mk(BLIT_WGSL, fmt, 'fq', 0, 0, 'vs', 'pal');
+    const lut = dev.createTexture({ label: 'palette lut', size: [1024, 32], format: 'rgba8unorm', usage: T.RENDER_ATTACHMENT | T.TEXTURE_BINDING });
+    const pb = dev.createBuffer({ label: 'palette', size: 4096, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); dev.queue.writeBuffer(pb, 0, palette());
+    const enc = dev.createCommandEncoder(), r = enc.beginRenderPass({ colorAttachments: [{ view: lut.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] });
+    r.setPipeline(fp); r.setBindGroup(0, bgE(fp, [[4, { buffer: pb }]])); r.draw(3); r.end(); dev.queue.submit([enc.finish()]); pb.destroy();
+    return { p, lut, qb: dev.createBuffer({ label: 'blit2', size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }) };
+  });
   const resize = () => {
     const d = Math.min(devicePixelRatio || 1, 3);
     W = Math.max(1, Math.round(innerWidth * d)); H = Math.max(1, Math.round(innerHeight * d));
@@ -207,7 +233,15 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     px = Math.max(1, Math.round(Math.sqrt(W * H / AREA)));
     // Skarpa: fractional scale (up to native, capped by the pixel budget); art = the classic pixel size in internal pixels
     if (edge === 2) { px = Math.max(1, Math.sqrt(W * H / AREA)); art = Math.max(1, Math.round(Math.sqrt(W * H / (hq ? 70000 : 115000)))) / px; } else art = 0;
+    // SS+palett: output pixels from a quarter of the budget, rays at half that size (art = 2 internal px)
+    if (edge === 3) { px = Math.max(1, Math.round(Math.sqrt(W * H * 4 / AREA))) / 2; art = 2; }
     iw = Math.ceil(W / px); ih = Math.ceil(H / px);
+    if (snes) {
+      // SNES-läge: always 256x224, the largest integer scale that fits (fractional only below 1x), centred
+      const k = Math.min(W / 256, H / 224); px = k >= 1 ? Math.floor(k) : k; art = 0; iw = 256; ih = 224;
+      const ox = Math.floor((W - 256 * px) / 2), oy = Math.floor((H - 224 * px) / 2), cs = innerWidth / W;
+      VR = [ox * cs, oy * cs, 256 * px * cs, 224 * px * cs]; QB.set([ox, oy], 0);
+    }
     rt?.destroy(); bt?.destroy(); lt?.destroy(); bt = lt = null;
     const u = T.RENDER_ATTACHMENT | T.TEXTURE_BINDING;
     rt = dev.createTexture({ label: 'scene', size: [iw, ih], format: hq ? 'rgba16float' : 'rgba8unorm', usage: u | T.COPY_SRC });   // COPY_SRC: black-frame probe
@@ -220,6 +254,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
       bgB = bgr(Q.bloom, [rt.createView()]); bgO = bgr(Q.out, [rt.createView(), bt.createView(), Q.sm]);
     }
     bg = bgr(blit, [(lt || rt).createView(), { buffer: bb }]);
+    if (useQ() && palP() && !palOff) bgQ = bgE(PQ.p, [[0, (lt || rt).createView()], [1, { buffer: bb }], [2, PQ.lut.createView()], [3, { buffer: PQ.qb }]]);
     bset();
   };
   addEventListener('resize', resize); resize();
@@ -246,7 +281,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const norm = (v) => { const l = Math.hypot(...v) || 1; return v.map((x) => x / l); };
   // ray from the camera through a screen point (client px); null = crosshair/centre
   const screenRay = (cx, cy) => {
-    const ax = iw / ih, ux = cx == null ? 0 : (cx / innerWidth) * 2 - 1, uy = cy == null ? 0 : (cy / innerHeight) * 2 - 1;
+    const v = vrect(), ax = iw / ih, ux = cx == null ? 0 : ((cx - v[0]) / v[2]) * 2 - 1, uy = cy == null ? 0 : ((cy - v[1]) / v[3]) * 2 - 1;
     const nx = ux * ax * cam.tan, ny = -uy * cam.tan;
     return norm([0, 1, 2].map((k) => cam.F[k] + cam.R[k] * nx + cam.Up[k] * ny));
   };
@@ -299,7 +334,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const panel = $('#s'); let row = 0, aSel = 0;
   const opened = () => panel.classList.contains('on');
   const syncPanel = () => {
-    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, tod, edge, dith, sikt, leaf: leafM() }[e.dataset.k])));
+    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: +hq, snes: +snes, tod, edge, dith, sikt, leaf: leafM() }[e.dataset.k])));
     panel.querySelectorAll('p').forEach((e, i) => e.classList.toggle('f', i === row));
     panel.querySelectorAll('[data-a]').forEach((e) => e.classList.toggle('on', acts(row)[aSel] === e));
   };
@@ -312,6 +347,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     else if (k === 'dith') { dith = v; localStorage.setItem('m7c-dither', v); bset(); }
     else if (k === 'edge') { if (edge !== +v) { edge = +v; localStorage.setItem('m7c-edge', v); AREA = area0(); slow = fast = 0; ceil = 1e9; resize(); } }
     else if (k === 'sikt') { sikt = +v; localStorage.setItem('m7c-view', v); resize(); }
+    else if (k === 'snes') { if (snes !== (v === '1' && !palOff)) { snes = v === '1' && !palOff; localStorage.setItem('m7c-snes', +snes); slow = fast = 0; ceil = 1e9; resize(); } }
     else { tod = v; localStorage.setItem('m7c-tod', v); }
     syncPanel();
   };
@@ -323,9 +359,10 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     if (tag === 'hq' && !hqOff) { hqOff = true; hq = false; AREA = area0(); slow = fast = 0; ceil = 1e9; }
     else if (tag === 'leaf' && !leafOff) leafOff = true;
     else if (tag === 'edge' && edge) { edge = 0; AREA = area0(); slow = fast = 0; ceil = 1e9; }
+    else if (tag === 'pal' && !palOff) { palOff = true; snes = false; if (edge === 3) { edge = 2; AREA = area0(); } slow = fast = 0; ceil = 1e9; }
     else if (tag === 'base') return fail('Grafiken kunde inte startas (WebGPU): ' + why);
     else return;
-    warn(`Grafik: ${{ hq: 'HQ', leaf: 'l\u00f6vm\u00f6nster', edge: 'skarpa kanter' }[tag]} fungerar inte h\u00e4r och st\u00e4ngdes av (${String(why).slice(0, 160)})`);
+    warn(`Grafik: ${{ hq: 'HQ', leaf: 'l\u00f6vm\u00f6nster', edge: 'skarpa kanter', pal: 'SNES-l\u00e4ge/SS+palett' }[tag]} fungerar inte h\u00e4r och st\u00e4ngdes av (${String(why).slice(0, 160)})`);
     resize(); syncPanel();
   });
   // black-frame probe, once per (HQ, leaves, edges) combination: reads 3 short rows of the scene target.
@@ -355,7 +392,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   };
   const moveRow = (dir) => { const n = rows().length; row = (row + dir + n) % n; aSel = 0; syncPanel(); };
   const enter = () => (acts(row).length ? runAct() : stepOpt(1));
-  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = ['fx', 'tod', 'edge', 'dith', 'leaf', 'sikt'].indexOf(d.k); setOpt(d.k, d.v); } if (d.a) { row = rows().indexOf(e.target.closest('p')); aSel = acts(row).indexOf(e.target); syncPanel(); ACT[d.a](); } });
+  panel.addEventListener('click', (e) => { const d = e.target.dataset; if (d.k) { row = rows().indexOf(e.target.closest('p')); setOpt(d.k, d.v); } if (d.a) { row = rows().indexOf(e.target.closest('p')); aSel = acts(row).indexOf(e.target); syncPanel(); ACT[d.a](); } });
   $('#g').addEventListener('click', togglePanel);
   for (const el of [panel, $('#g')]) el.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
   syncPanel();
@@ -591,8 +628,8 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
       const d = [p[0] - cam.o[0], p[1] - cam.o[1], p[2] + 2.25 - cam.o[2]], z = d[0] * cam.F[0] + d[1] * cam.F[1] + d[2] * cam.F[2];
       if (z < 0.5 || z > far) { r.tag.style.display = 'none'; continue; }
       const ax = iw / ih, ux = (d[0] * cam.R[0] + d[1] * cam.R[1] + d[2] * cam.R[2]) / z / (ax * cam.tan), uy = -(d[0] * cam.Up[0] + d[1] * cam.Up[1] + d[2] * cam.Up[2]) / z / cam.tan;
-      const s = Math.min(4, Math.max(1, Math.round(innerHeight / (cam.tan * z) * 0.5 / 13 * 2) / 2)), w = r.tag.width * s;
-      r.tag.style.cssText = `display:block;width:${w}px;height:${13 * s}px;transform:translate(${Math.round((ux + 1) / 2 * innerWidth - w / 2)}px,${Math.round((uy + 1) / 2 * innerHeight - 13 * s)}px)`;
+      const v = vrect(), s = Math.min(4, Math.max(1, Math.round(v[3] / (cam.tan * z) * 0.5 / 13 * 2) / 2)), w = r.tag.width * s;
+      r.tag.style.cssText = `display:block;width:${w}px;height:${13 * s}px;transform:translate(${Math.round(v[0] + (ux + 1) / 2 * v[2] - w / 2)}px,${Math.round(v[1] + (uy + 1) / 2 * v[3] - 13 * s)}px)`;
     }
     U[85] = k;
   };
@@ -733,7 +770,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     }
     pass(enc, rt, SP, sg);
     if (hq) { pass(enc, bt, Q.bloom, bgB); pass(enc, lt, Q.out, bgO); }
-    pass(enc, ctx.getCurrentTexture(), blit, bg);
+    if (useQ()) pass(enc, ctx.getCurrentTexture(), PQ.p, bgQ); else pass(enc, ctx.getCurrentTexture(), blit, bg);
     dev.queue.submit([enc.finish()]); drawn = rt;
   };
   // test hook: mean GPU frame time (ms) over n frames, each awaited to completion
@@ -801,7 +838,13 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     U.set([tH, wx, wy, WS, FOGS], 80);   // edge fog over the last 45% of the view distance (?fogs = start fraction, 0.35 = v10)
     if (hl) U.set([...hl.b, 1], 32);
     netFrame(far);
-    U[39] = edge === 1 ? -1 : art;
+    U[39] = edge === 1 && !snes ? -1 : art;
+    if (useQ()) {
+      // SNES fog colour: the horizon sky (HQ: scaled by daylight, warmed by the sun near the horizon)
+      const fc = hq ? (() => { const s = sun(now / 1000 + t0), w = Math.sqrt(s[3]); return [0.761, 0.859, 0.941].map((x, i) => Math.min(1, x * w + s[1][i] * 0.08 * (1 - s[3]))); })() : [0.761, 0.859, 0.941];
+      QB.set([snes ? 2 : 1, dith === '1' || (dith === 'auto' && hq) ? 1 : 0, sp, cp, tanV, Math.max(0.5, cam.o[2] - st[2]), far, 0.3, V.fog ? 0.5 : 0, 0, ...fc], 2);
+      dev.queue.writeBuffer(PQ.qb, 0, QB);
+    }
     if (hq) { const [d, c, sky, w] = sun(now / 1000 + t0); U.set(sky, 29); U.set([...d, 0, ...c, w], 72); sunD = d; }
     // torch lights: re-pick the nearest 32 every ~0.3 s (or after an edit), flicker per frame
     if ((lightsT -= dt) <= 0 || !dt) {
@@ -821,8 +864,9 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     // ~55+ fps for 3 s steps up towards the mode's cap, never back above a level that was too slow
     if (acc > 1 && warm++ < 2) { acc = 0; frames = 0; }   // skip the first 2 s (pipeline compile, world upload)
     if (acc > 1) {
-      const ft = acc / frames, lo = hq ? 25000 : 45000;
-      if (ft > 0.022 && AREA > lo) { fast = 0; if (ft > 0.05 || ++slow >= 2) { if (slow) ceil = AREA * 0.95; AREA = Math.max(lo, AREA * (ft > 0.05 ? 0.6 : 0.75)); resize(); slow = 0; } }
+      const ft = acc / frames, lo = (hq ? 25000 : 45000) * (edge === 3 ? 4 : 1);
+      if (snes) { /* SNES-läge: fixed 256x224 */ }
+      else if (ft > 0.022 && AREA > lo) { fast = 0; if (ft > 0.05 || ++slow >= 2) { if (slow) ceil = AREA * 0.95; AREA = Math.max(lo, AREA * (ft > 0.05 ? 0.6 : 0.75)); resize(); slow = 0; } }
       else if (ft < 0.0185 && !fixedArea && AREA < Math.min(amax(), ceil) * 0.99) { slow = 0; if (++fast >= 3) { AREA = Math.min(AREA * 1.25, amax(), ceil); resize(); fast = 0; } }
       else slow = fast = 0;
       acc = 0; frames = 0;
