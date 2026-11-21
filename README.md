@@ -1,6 +1,25 @@
-# Mode7craft v13.2 (HQ anti-aliasing)
+# Mode7craft v13.2.1 (Upplösning + faster HQ)
 
 ![Mode7craft](docs/screenshot.png)
+
+- Why v13.2 HQ felt sluggish:
+  - The old dynamic resolution (1 s windows) counted a vsync-capped 16.7 ms frame as "fast" and kept adding rays. It only stepped down after 2 s below ~45 fps, and there is a dead zone at 18.5-22 ms.
+  - v13.2 raised the HQ cap from 500k rays to the full screen (5.6M on a MacBook Air) and started at 1.2M, so the game climbed until it ran at 45-55 fps with judder.
+  - On top of that, the anti-aliasing resolve, its history and the sharpening always ran at full screen resolution.
+- New settings row `Upplösning` (`m7c-res`, `?res=auto|lag|medel|hog|native` or `a|l|m|h|n`):
+  - Auto (default) is dynamic.
+  - Låg / Medel / Hög are fixed budgets of ~0.5M / 1M / 2M rays.
+  - Native is one ray per screen pixel (4K cap).
+  - It applies to Skarpa and SS+palett in Standard and HQ. Pixel/Mjuka keep their classic pixel size and SNES its 256x224, so the row is greyed out there.
+  - With the default Auto, Standard/SNES/Pixel/Mjuka/SS+palett/`?aa=0` behave exactly as in v13.1.
+- HQ anti-aliasing (HQ + Skarpa):
+  - Resolve size: the resolve and its history are capped at Auto/Medel 2.6M px, Låg 1.5M, Hög 4.2M and Native the full screen. A new final pass (`fa` in `web/blit.wgsl`) scales the result to the screen bilinearly and sharpens it. Dithering and the crosshair moved into a shared `post()`, with the same math as before.
+  - Auto starts at 500k rays (250k on touch screens). Every 10 frames it checks the frame time against the display refresh (60 Hz, or faster if frames show it):
+    - With GPU timestamps it scales the rays so a GPU frame fits in ~80% of a refresh. It drops at once and grows by at most +20% per check.
+    - Without timestamps, a frame more than 15% over the refresh drops 30% at once, and that level becomes a ceiling for 20 s. About 2 s at the refresh grows it 12%.
+  - The Info overlay shows `internal -> resolve AA` and the active `Upplösning`.
+
+# Mode7craft v13.2 (HQ anti-aliasing)
 
 - Why HQ looked jagged: HQ + Skarpa traced at most 500k rays per frame (it started at 200k, 40% of the cap), one ray per internal pixel, and the blit upscaled with nearest. On a 2x laptop screen (2940x1912 = 5.6M pixels) each ray covered a 3.3-5.3 pixel block with hard staircase edges, and distant texels, leaf cutouts and shadow edges shimmered as you moved, since there was no anti-aliasing anywhere.
 - HQ + Skarpa now renders with temporal super-resolution:

@@ -11,14 +11,6 @@ fn sim(a: vec4f, b: vec4f) -> bool { let e = abs(a - b); return e.a < 0.002 && e
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let ip = vec2i(fc.xy / B.x); var c = textureLoad(src, ip, 0);
   let fl = u32(B.w);
-  if ((fl & 4u) != 0u) {
-    // v13.2 HQ anti-aliasing output (native res): light contrast-limited sharpening of the resolved image
-    let m = vec2i(textureDimensions(src)) - 1;
-    let n = textureLoad(src, clamp(ip - vec2i(0, 1), vec2i(0), m), 0).rgb; let s = textureLoad(src, clamp(ip + vec2i(0, 1), vec2i(0), m), 0).rgb;
-    let w = textureLoad(src, clamp(ip - vec2i(1, 0), vec2i(0), m), 0).rgb; let e = textureLoad(src, clamp(ip + vec2i(1, 0), vec2i(0), m), 0).rgb;
-    let lo = min(min(n, s), min(w, e)); let hi = max(max(n, s), max(w, e));
-    c = vec4f(clamp(c.rgb + (c.rgb * 4. - n - s - w - e) * 0.18, min(lo, c.rgb), max(hi, c.rgb)), 1.);
-  }
   if ((fl & 1u) != 0u) {
     // 'Mjuka kanter': Scale2x-style corner rule on the internal pixels, with an anti-aliased 45-degree
     // cut instead of a hard quadrant, so staircases turn into smooth diagonals (5 loads, no blur on flat areas)
@@ -31,6 +23,11 @@ fn sim(a: vec4f, b: vec4f) -> bool { let e = abs(a - b); return e.a < 0.002 && e
       c = vec4f(mix(c.rgb, (A.rgb + V.rgb) * 0.5, clamp((k.x + k.y - 1.) * B.x * 0.35 + 0.5, 0., 1.)), 1.);
     }
   }
+  return post(c, fc);
+}
+// dithering + crosshair, shared by the plain upscale and the HQ anti-aliasing output (fa)
+fn post(c0: vec4f, fc: vec4f) -> vec4f {
+  var c = c0; let fl = u32(B.w);
   if ((fl & 2u) != 0u) {
     // SNES-style ordered dithering: 4x4 Bayer threshold per art pixel, quantised to a limited palette per channel
     let z = max(B.z, 1.); let q = vec2u(floor(fc.xy / (B.x * z))) & vec2u(3u);
@@ -118,4 +115,17 @@ fn palQ(c: vec3f, cell: vec2i, dit: bool) -> vec3f {
     if (d < bd) { bd = d; bc = p; }
   }
   return vec4f(bc, 1.);
+}
+// v13.2.1 HQ anti-aliasing output: the resolved image (at most the screen size) scaled to the screen with
+// bilinear filtering (B.x = screen px per resolved px; 1 = native, exact texels) + light contrast-limited sharpening
+@group(0) @binding(5) var smp: sampler;
+@fragment fn fa(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let ds = vec2f(textureDimensions(src)); let uv = fc.xy / B.x / ds; let o = 1. / ds;
+  var c = textureSampleLevel(src, smp, uv, 0.).rgb;
+  if ((u32(B.w) & 4u) != 0u) {
+    let n = textureSampleLevel(src, smp, uv - vec2f(0., o.y), 0.).rgb; let s = textureSampleLevel(src, smp, uv + vec2f(0., o.y), 0.).rgb;
+    let w = textureSampleLevel(src, smp, uv - vec2f(o.x, 0.), 0.).rgb; let e = textureSampleLevel(src, smp, uv + vec2f(o.x, 0.), 0.).rgb;
+    c = clamp(c + (c * 4. - n - s - w - e) * 0.18, min(min(min(n, s), min(w, e)), c), max(max(max(n, s), max(w, e)), c));
+  }
+  return post(vec4f(c, 1.), fc);
 }

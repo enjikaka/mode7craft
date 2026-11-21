@@ -206,9 +206,17 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   // resolved at screen resolution by a temporal pass (hq.wgsl 'ft'); dynamic resolution keeps the frame rate
   const aaq = qs.get('aa') !== '0'; let aaOff = false; const aaSharp = qs.get('sharp') !== '0';
   const aaOn = () => hq && edge === 2 && !snes && aaq && !aaOff && !hqOff;
-  const amax = () => aaOn() ? Math.max(1e6, Math.min(W * H, 8.3e6)) : edge === 2 || edge === 3 ? (hq ? 500000 : 1000000) : (hq ? 70000 : 115000) * (edge === 3 ? 4 : 1);
+  // v13.2.1 'Upplösning' (m7c-res, ?res=): a = Auto (dynamic), l/m/h = fixed ~0.5M/1M/2M rays, n = Native (screen, 4K cap).
+  // Applies to Skarpa and SS+palett (Standard + HQ); Pixel/Mjuka keep their classic pixel size, SNES its 256x224.
+  const RQ = { auto: 'a', low: 'l', lag: 'l', 'l\u00e5g': 'l', medium: 'm', medel: 'm', high: 'h', hog: 'h', 'h\u00f6g': 'h', native: 'n' };
+  const rq = (qs.get('res') || '').toLowerCase(); let resv = RQ[rq] || ('almhn'.includes(rq) && rq.length === 1 ? rq : localStorage.getItem('m7c-res') || 'a');
+  const resOn = () => !snes && edge >= 2, resFix = () => resOn() && resv !== 'a' && !qs.has('area');
+  // HQ AA resolve size cap (pixels): Auto resolves at most ~1440p-class 2.6M px, then a bilinear upscale to the screen
+  const aaO = () => Math.max(1, Math.min(W * H, { a: 2.6e6, l: 1.5e6, m: 2.6e6, h: 4.2e6, n: 8.3e6 }[resv]));
+  const fixLv = () => Math.min({ l: 5e5, m: 1e6, h: 2e6, n: 8.3e6 }[resv], aaOn() ? aaO() : W * H * (edge === 3 ? 4 : 1));
+  const amax = () => aaOn() ? aaO() : edge === 2 || edge === 3 ? (hq ? 500000 : 1000000) : (hq ? 70000 : 115000) * (edge === 3 ? 4 : 1);
   // SS+palett (v13.1) starts at 60%: the classic grid at 720p, finer as dynamic resolution climbs
-  const area0 = () => aaOn() ? (matchMedia('(pointer: coarse)').matches ? 5e5 : 1.2e6) : edge === 2 ? amax() * 0.4 : edge === 3 ? amax() * 0.6 : amax();
+  const area0 = () => resFix() && W ? fixLv() : aaOn() ? (matchMedia('(pointer: coarse)').matches ? 2.5e5 : 5e5) : edge === 2 ? amax() * 0.4 : edge === 3 ? amax() * 0.6 : amax();
   let rt, sg, bg, W = 0, H = 0, px = 1, iw = 0, ih = 0, AREA = +qs.get("area") || area0(), cross = 0;
   // ordered 4x4 Bayer dithering to a limited palette in the upscale: 'auto' = HQ only, '1' on, '0' off
   const dq = qs.get('dither'); let dith = dq ?? localStorage.getItem('m7c-dither') ?? '0';
@@ -224,10 +232,10 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     snes = on;
   };
   if (fx0 === 's') snesSet(true);
-  const bset = () => { const f = (edge === 1 ? 1 : 0) + (dith === '1' || (dith === 'auto' && hq) ? 2 : 0); dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, art, f])); if (AA) dev.queue.writeBuffer(AA.bb, 0, new Float32Array([1, cross, art * px, f + (aaSharp ? 4 : 0)])); };
+  const bset = () => { const f = (edge === 1 ? 1 : 0) + (dith === '1' || (dith === 'auto' && hq) ? 2 : 0); dev.queue.writeBuffer(bb, 0, new Float32Array([px, cross, art, f])); if (AA) dev.queue.writeBuffer(AA.bb, 0, new Float32Array([1 / AA.s, cross, art * px * AA.s, f + (aaSharp ? 4 : 0)])); };
   // AA state: screen-res history pair (rgb10a2, ping-pong), its bind groups, the resolve's uniforms, frame counter
   let AA = null, AP = null;
-  const aaP = () => AP ||= { p: mk(HQ_WGSL, 'rgb10a2unorm', 'ft', 0, 0, 'vs', 'aa') };
+  const aaP = () => AP ||= { p: mk(HQ_WGSL, 'rgb10a2unorm', 'ft', 0, 0, 'vs', 'aa'), o: mk(BLIT_WGSL, fmt, 'fa', 0, 0, 'vs', 'aa') };
   const halton = (i, b) => { let f = 1, r = 0; for (; i > 0; i = Math.floor(i / b)) { f /= b; r += f * (i % b); } return r; };
   // v13 palette: 23 block/sky/sunset/skin colours x 11 shades (darker shades shift blue like the game's shadows) + black, grey, white,
   // all cut to 15 bits; the GPU turns it into the 15-bit -> nearest-colour table once, the first time it is needed
@@ -253,6 +261,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     const d = Math.min(devicePixelRatio || 1, 3);
     W = Math.max(1, Math.round(innerWidth * d)); H = Math.max(1, Math.round(innerHeight * d));
     cv.width = W; cv.height = H;
+    if (resFix()) AREA = fixLv(); else if (aaOn()) AREA = Math.min(AREA, aaO());
     px = Math.max(1, Math.round(Math.sqrt(W * H / AREA)));
     // Skarpa: fractional scale (up to native, capped by the pixel budget); art = the classic pixel size in internal pixels
     if (edge === 2) { px = Math.max(1, Math.sqrt(W * H / AREA)); art = Math.max(1, Math.round(Math.sqrt(W * H / (hq ? 70000 : 115000)))) / px; } else art = 0;
@@ -280,11 +289,13 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     }
     bg = bgr(blit, [(lt || rt).createView(), { buffer: bb }]);
     if (aaOn() && aaP() && !aaOff) {
-      if (!AA || AA.w !== W || AA.h !== H) {
+      // resolve size: the screen scaled by sc (<= 1) to the option's pixel cap
+      const sc = Math.min(1, Math.sqrt(aaO() / (W * H))), ow = Math.ceil(W * sc - 1e-6), oh = Math.ceil(H * sc - 1e-6);
+      if (!AA || AA.w !== ow || AA.h !== oh) {
         AA?.t.forEach((t) => t.destroy());
-        const t = [0, 1].map(() => dev.createTexture({ label: 'aa history', size: [W, H], format: 'rgb10a2unorm', usage: u | T.COPY_SRC }));
-        AA = { t, w: W, h: H, i: 0, n: 0, prev: null, ub: AA?.ub || dev.createBuffer({ label: 'uniforms', size: 160, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }), bb: AA?.bb || dev.createBuffer({ label: 'uniforms', size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }) };
-        AA.bo = t.map((x) => bgr(blit, [x.createView(), { buffer: AA.bb }]));
+        const t = [0, 1].map(() => dev.createTexture({ label: 'aa history', size: [ow, oh], format: 'rgb10a2unorm', usage: u | T.COPY_SRC }));
+        AA = { t, w: ow, h: oh, s: sc, i: 0, n: 0, prev: null, ub: AA?.ub || dev.createBuffer({ label: 'uniforms', size: 160, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }), bb: AA?.bb || dev.createBuffer({ label: 'uniforms', size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }) };
+        AA.bo = t.map((x) => bgE(AP.o, [[0, x.createView()], [1, { buffer: AA.bb }], [5, Q.sm]]));
       }
       // a new internal resolution keeps the history (it lives at screen resolution); a new screen size starts over
       // bg pair k: write history k, read history 1 - k
@@ -370,8 +381,8 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
   const panel = $('#s'); let row = 0, aSel = 0;
   const opened = () => panel.classList.contains('on');
   const syncPanel = () => {
-    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: snes ? 's' : +hq, info: +info, tod, edge, dith, sikt, leaf: leafM() }[e.dataset.k])));
-    panel.querySelectorAll('p').forEach((e, i) => { e.classList.toggle('f', i === row); e.classList.toggle('x', snes && !!e.querySelector('[data-k="tod"],[data-k="edge"],[data-k="dith"],[data-k="leaf"],[data-k="sikt"]')); });
+    panel.querySelectorAll('i').forEach((e) => e.classList.toggle('on', e.dataset.v === String({ fx: snes ? 's' : +hq, info: +info, tod, edge, dith, sikt, leaf: leafM(), res: resv }[e.dataset.k])));
+    panel.querySelectorAll('p').forEach((e, i) => { e.classList.toggle('f', i === row); e.classList.toggle('x', (snes && !!e.querySelector('[data-k="tod"],[data-k="edge"],[data-k="dith"],[data-k="leaf"],[data-k="sikt"]')) || (!resOn() && !!e.querySelector('[data-k="res"]'))); });
     panel.querySelectorAll('[data-a]').forEach((e) => e.classList.toggle('on', acts(row)[aSel] === e));
   };
   const ACT = { exp: exportWorld, imp: () => fileIn.click(), shr: shareLink, inv: () => { togglePanel(); net.invite(); }, nam: () => { togglePanel(); askName('Byt namn'); }, lv: () => net.mp ? net.leave() : toast('Du spelar ensam') };
@@ -388,6 +399,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     else if (k === 'dith') { dith = v; localStorage.setItem('m7c-dither', v); bset(); }
     else if (k === 'edge') { if (edge !== +v) { edge = +v; localStorage.setItem('m7c-edge', v); AREA = area0(); slow = fast = 0; ceil = 1e9; resize(); } }
     else if (k === 'sikt') { sikt = +v; localStorage.setItem('m7c-view', v); resize(); }
+    else if (k === 'res') { if (!resOn()) return syncPanel(); resv = v; localStorage.setItem('m7c-res', v); AREA = area0(); slow = fast = 0; ceil = 1e9; Object.assign(drs, { ok: 0, ceil: 1e9, w: 0, t: 0, d: [] }); resize(); }
     else { tod = v; localStorage.setItem('m7c-tod', v); }
     syncPanel();
   };
@@ -820,27 +832,47 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
       const c = enc.beginComputePass(); c.setPipeline(Q.bake); c.setBindGroup(0, Q.bg); c.dispatchWorkgroups(WS * WS * NZ / 1024); c.end();
       bakedL = sunD; bakedW = wx + ',' + wy; bakeDirty = false; bakes++;
     }
-    const ts = info && tsInit() && !tsQ.busy ? tsQ : null;   // GPU time of scene .. final blit (Info overlay)
+    const ts = (info || drsOn()) && tsInit() && !tsQ.busy ? tsQ : null;   // GPU time of scene .. final blit (Info overlay)
     if (AA) {
       // HQ AA: this frame's ray jitter (Halton 2,3, 16 frames) and the resolve's two cameras
       const n = AA.n++ % 16 + 1, jx = halton(n, 2) - 0.5, jy = halton(n, 3) - 0.5;
       dev.queue.writeBuffer(ub, 86 * 4, new Float32Array([jx + 2, jy]));
-      const c = [...cam.o, px, ...cam.F, cam.tan, ...cam.R, iw / ih, ...cam.Up], e = [iw * px, ih * px];
+      const p2 = px * AA.s, c = [...cam.o, p2, ...cam.F, cam.tan, ...cam.R, iw / ih, ...cam.Up], e = [iw * p2, ih * p2];
       dev.queue.writeBuffer(AA.ub, 0, new Float32Array([...c, AA.prev ? 0 : 1, ...(AA.prev || c), 0, jx, jy, ...e, ...(AA.prev ? AA.pe : e), 0, 0]));
       AA.prev = c; AA.pe = e;
     }
     pass(enc, rt, SP, sg, ts ? { querySet: ts.q, beginningOfPassWriteIndex: 0 } : undefined);
     if (hq) { pass(enc, bt, Q.bloom, bgB); pass(enc, lt, Q.out, bgO); }
     const te = ts ? { querySet: ts.q, endOfPassWriteIndex: 1 } : undefined;
-    if (AA) { const k = AA.i ^= 1; pass(enc, AA.t[k], AP.p, AA.bt[k]); pass(enc, ctx.getCurrentTexture(), blit, AA.bo[k], te); }
+    if (AA) { const k = AA.i ^= 1; pass(enc, AA.t[k], AP.p, AA.bt[k]); pass(enc, ctx.getCurrentTexture(), AP.o, AA.bo[k], te); }
     else if (useQ()) pass(enc, ctx.getCurrentTexture(), PQ.p, bgQ, te); else pass(enc, ctx.getCurrentTexture(), blit, bg, te);
     if (ts) { enc.resolveQuerySet(ts.q, 0, 2, ts.rb, 0); enc.copyBufferToBuffer(ts.rb, 0, ts.mb, 0, 16); }
     dev.queue.submit([enc.finish()]); drawn = rt;
-    if (ts) { ts.busy = true; ts.mb.mapAsync(GPUMapMode.READ).then(() => { const a = new BigUint64Array(ts.mb.getMappedRange()); const d = Number(a[1] - a[0]) / 1e6; ts.mb.unmap(); if (d > 0 && d < 1000) { ts.s += d; ts.n++; } ts.busy = false; }, () => { ts.busy = false; }); }
+    if (ts) { ts.busy = true; ts.mb.mapAsync(GPUMapMode.READ).then(() => { const a = new BigUint64Array(ts.mb.getMappedRange()); const d = Number(a[1] - a[0]) / 1e6; ts.mb.unmap(); if (d > 0 && d < 1000) { drs.gs += d; drs.gn++; ts.s += d; ts.n++; } ts.busy = false; }, () => { ts.busy = false; }); }
   };
   // test hook: mean GPU frame time (ms) over n frames, each awaited to completion
   const bench = async (n, fb) => { await dev.queue.onSubmittedWorkDone(); const t = Date.now(); for (let i = 0; i < n; i++) { draw(fb); await dev.queue.onSubmittedWorkDone(); } return { ms: (Date.now() - t) / n, iw, ih, hq }; };
   let ferr = 0;
+  // v13.2.1 HQ AA Auto resolution: judged every 10 frames against the display refresh (fastest steady frame
+  // interval seen, 60 Hz if never faster). With GPU timestamps: rays scaled so the GPU frame fits ~80% of a refresh
+  // (down at once, up by at most 20% per window); without: >15% over the refresh -> -30% at once (and that level
+  // becomes a ceiling for 20 s), at the refresh for ~2 s -> +12%.
+  const drs = { d: [], t: 0, gs: 0, gn: 0, w: 0, ok: 0, ceil: 1e9, ct: 0, P: 16.7 };
+  const drsOn = () => !!AA && resv === 'a' && !qs.has('area');
+  const drsAA = (ms) => {
+    const D = drs.d; D.push(ms); drs.t += ms; if (D.length < 10 && (drs.t < 250 || D.length < 2)) return;   // 10 frames or 1/4 s
+    D.sort((a, b) => a - b); const f = D[D.length >> 1], q = D[1], n = D.length; D.length = 0;
+    const g = drs.gn ? drs.gs / drs.gn : 0; drs.gs = drs.gn = 0;
+    if ((drs.w += drs.t) < 1500) { drs.t = 0; return; } drs.t = 0;   // first 1.5 s: pipeline compile, world upload
+    drs.P = Math.max(6.9, Math.min(16.7, Math.min(drs.P, q < 15.5 ? q * 1.02 : 16.7)));
+    const P = drs.P, lo = 1e5, hi = aaO(); let A = AREA;
+    if ((drs.ct += f * n) > 20000) { drs.ct = 0; drs.ceil *= 1.15; }
+    if (g) { const r = P * 0.8 / g; if (r < 0.97) A *= Math.max(0.5, r * 0.95); else if (r > 1.15 && f < P * 1.1) A *= Math.min(1.2, r * 0.92); }
+    else if (f > P * 1.15) { drs.ceil = AREA * 0.95; A *= 0.7; drs.ok = 0; }
+    else if (f < P * 1.05 && ++drs.ok >= 10) { A = Math.min(A * 1.12, drs.ceil); drs.ok = 0; }
+    A = Math.max(lo, Math.min(hi, A));
+    if (Math.abs(A - AREA) > AREA * 0.06) { AREA = A; resize(); }
+  };
   // v13.1 Info overlay (Inställningar > Info, ?info=1): fps, frame ms, CPU ms (tick), GPU ms (timestamp queries,
   // only when the device has them), GPU memory and internal resolution, 4x per second. Off = nothing measured.
   let tsQ = null, iT = 0, iN = 0, iF = 0, iC = 0;
@@ -851,7 +883,7 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     const sec = (now - iT) / 1000, g = tsQ && tsQ.n ? tsQ.s / tsQ.n : 0, mb = (m7.gpuMem().total / 1048576).toFixed(2);
     iF = iF ? iF * 0.5 + (iN / sec) * 0.5 : iN / sec;
     // same hard-edged pixel text as the nametags: white glyphs thresholded on a translucent black plate
-    const L = [`${iF.toFixed(0)} FPS  ${(sec * 1000 / iN).toFixed(1)} ms`, `CPU ${(iC / iN).toFixed(1)} ms${tsQ ? `  GPU ${g.toFixed(1)} ms` : ''}`, `VRAM ${mb} MB`, `${iw}x${ih}${snes ? ' SNES' : ''}${AA ? ` \u2192 ${W}x${H} AA` : ''}`];
+    const L = [`${iF.toFixed(0)} FPS  ${(sec * 1000 / iN).toFixed(1)} ms`, `CPU ${(iC / iN).toFixed(1)} ms${tsQ ? `  GPU ${g.toFixed(1)} ms` : ''}`, `VRAM ${mb} MB`, `${iw}x${ih}${snes ? ' SNES' : ''}${AA ? ` \u2192 ${AA.w}x${AA.h} AA` : ''}`, `Uppl\u00f6sning ${resOn() ? { a: 'Auto', l: 'L\u00e5g', m: 'Medel', h: 'H\u00f6g', n: 'Native' }[resv] : snes ? 'SNES' : 'Pixel'}`];
     const x = infoEl.getContext('2d'), F = '10px ui-monospace,Menlo,monospace'; x.font = F;
     infoEl.width = Math.ceil(Math.max(...L.map((l) => x.measureText(l).width))) + 6; infoEl.height = L.length * 12 + 3;
     x.font = F; x.textBaseline = 'top'; x.fillStyle = '#fff'; L.forEach((l, i) => x.fillText(l, 3, 2 + i * 12));
@@ -944,19 +976,20 @@ const wasmP = WebAssembly.instantiateStreaming(fetch('g.wasm'), { env: { msin: M
     dev.queue.writeBuffer(ub, 0, U);
     draw();
     acc += Math.min(rdt, 0.5); frames++;   // real frame time (dt is clamped for physics)
+    if (drsOn()) drsAA(rdt * 1000);
     // adaptive resolution, checked every second: below ~45 fps for 2 s (or below ~20 fps at once) steps down;
     // ~55+ fps for 3 s steps up towards the mode's cap, never back above a level that was too slow
     if (acc > 1 && warm++ < 2) { acc = 0; frames = 0; }   // skip the first 2 s (pipeline compile, world upload)
     if (acc > 1) {
       const ft = acc / frames, lo = (hq ? 25000 : 45000) * (edge === 3 ? 4 : 1);
-      if (snes) { /* SNES-läge: fixed 256x224 */ }
+      if (snes || drsOn() || resFix()) { /* SNES-läge: fixed 256x224; HQ AA Auto: drsAA below; fixed Upplösning */ }
       else if (ft > 0.022 && AREA > lo) { fast = 0; if (ft > 0.05 || ++slow >= 2) { if (slow) ceil = AREA * 0.95; AREA = Math.max(lo, AREA * (ft > 0.05 ? 0.6 : 0.75)); resize(); slow = 0; } }
       else if (ft < 0.0185 && !fixedArea && AREA < Math.min(amax(), ceil) * 0.99) { slow = 0; if (++fast >= 3) { AREA = Math.min(AREA * 1.25, amax(), ceil); resize(); fast = 0; } }
       else slow = fast = 0;
       acc = 0; frames = 0;
     }
   };
-  window.m7 = { net, act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; }, get area() { return AREA; }, get sikt() { return sikt; }, get migrated() { return migrated; }, gpuMem: () => { const o = {}; let t = 0; for (const [k, b] of gmem.values()) { o[k] = (o[k] || 0) + b; t += b; } const sw = W * H * 4 * 3; return { total: t, swapchain3: sw, all: t + sw, ...o }; } }; // handy for tests
+  window.m7 = { net, act, target, setSlot, X, edits, save, pack, unpack, b64, importBytes, shareLink, exportWorld, loadWorld, bench, setOpt, togglePanel, get bakes() { return bakes; }, get view() { return view; }, get area() { return AREA; }, get res() { return resv; }, get aa() { return AA && [AA.w, AA.h, iw, ih]; }, get sikt() { return sikt; }, get migrated() { return migrated; }, gpuMem: () => { const o = {}; let t = 0; for (const [k, b] of gmem.values()) { o[k] = (o[k] || 0) + b; t += b; } const sw = W * H * 4 * 3; return { total: t, swapchain3: sw, all: t + sw, ...o }; } }; // handy for tests
   // shared world link (#w=...): load it, then drop the hash so later local edits stay local
   const hw = location.hash.match(/^#w=([\w-]+)/);
   if (hw) { history.replaceState(null, '', location.pathname + location.search); try { await importBytes(unb64(hw[1])); } catch { toast('Ogiltig l\u00e4nk'); } }
