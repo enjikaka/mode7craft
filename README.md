@@ -1,6 +1,10 @@
-# Mode7craft v13.1
+# Mode7craft v14
 
 ![Mode7craft](docs/screenshot.png)
+
+- Experimental **sprite-stacking** test mode (`?stack=1`, or Inställningar → Stack (test)). Not a Grafik option; default look is unchanged from v13.1. First person falls back to the ray tracer. Chase/top-down pitch is floored at 0.5 rad. The renderer is a lazy `stack.js` (~a few KB gzip) of instanced 16×16 tile quads, 16 Z-layers, sampling the existing voxel texture. Editing and nametags still work.
+
+# Mode7craft v13.1
 
 - SS+palett was soft: its output grid was the classic Pixel grid (4 screen px per pixel at 1280x720 HQ) and every output pixel was the plain mean of its 2x2 rays, which blended texel borders into mush. Now the output pixel is a whole number of screen pixels (1 = native) picked from Skarpa's budget (1M Standard / 500k HQ rays, starts at 60%, dynamic resolution as before), upscaled with nearest only, and the resolve takes the mean only where the 4 rays agree; where they differ it takes the medoid (the ray closest to the other three), so edges and texels stay hard. Crosshair and dither cells stay classic-pixel sized.
 - Grafik row is now SNES / Standard / HQ (`m7c-fx` = `s` / `0` / `1`). The separate SNES-läge row is gone; old `m7c-snes=1` is migrated and `?snes=1` still works. SNES sets Standard lighting, Kanter Pixel, Löv Block, Sikt Normal, Dither Av and greys out those rows (and Tid); going back to Standard/HQ restores your own choices.

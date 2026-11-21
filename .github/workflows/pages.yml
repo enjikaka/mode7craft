@@ -41,10 +41,12 @@ jobs:
         run: |
           test -s dist/index.html
           test -s dist/g.wasm
+          test -s dist/stack.js
           mkdir -p _site
-          cp dist/index.html dist/g.wasm .nojekyll _site/
+          cp dist/index.html dist/g.wasm dist/stack.js .nojekyll _site/
           test -s _site/index.html
           test -s _site/g.wasm
+          test -s _site/stack.js
           test -f _site/.nojekyll
 
       - name: Publish to gh-pages
