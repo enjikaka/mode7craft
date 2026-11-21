@@ -1,8 +1,18 @@
-# Mode7craft v14
+# Mode7craft v13.2 (HQ anti-aliasing)
 
 ![Mode7craft](docs/screenshot.png)
 
-- Experimental **sprite-stacking** test mode (`?stack=1`, or Inställningar → Stack (test)). Not a Grafik option; default look is unchanged from v13.1. First person falls back to the ray tracer. Chase/top-down pitch is floored at 0.5 rad. The renderer is a lazy `stack.js` (~a few KB gzip) of instanced 16×16 tile quads, 16 Z-layers, sampling the existing voxel texture. Editing and nametags still work.
+- Why HQ looked jagged: HQ + Skarpa traced at most 500k rays per frame (it started at 200k, 40% of the cap), one ray per internal pixel, and the blit upscaled with nearest. On a 2x laptop screen (2940x1912 = 5.6M pixels) each ray covered a 3.3-5.3 pixel block with hard staircase edges, and distant texels, leaf cutouts and shadow edges shimmered as you moved, since there was no anti-aliasing anywhere.
+- HQ + Skarpa now renders with temporal super-resolution:
+  - Budget: rays go up to the native screen resolution (capped at 4K, 8.3M pixels). It starts at 800k and dynamic resolution climbs while frames stay fast, as before.
+  - Jitter: each frame the rays are jittered inside their pixel (Halton 2,3 over 16 frames, `U[21].zw`, only when `U[21].z > 1`). The scene target's alpha holds the hit distance.
+  - Resolve (`ft` in `web/hq.wgsl`): runs at screen resolution. It rebuilds the frame from the 3x3 jittered samples, reprojects last frame's result with that distance and both cameras (Catmull-Rom), and clips it to the current neighbourhood's YCoCg variance box, so nothing ghosts. It then blends about 1/10 of the new frame and writes into an rgb10a2 history pair.
+  - Output: the normal blit runs at 1:1 with a light contrast-limited sharpen (blit flag bit 4).
+  - Still views converge to 16+ rays per screen pixel. Edges, distant texels, leaf cutouts and shadow edges come out smooth, and resolutions below native are upscaled cleanly instead of in blocks.
+  - In this mode see-through clouds are blended instead of Bayer-dithered.
+- Toggles: `?aa=0` gives the exact v13.1 HQ look and `?sharp=0` turns off the sharpen. If the resolve pipeline fails, or a probe finds the history black, AA switches off for the session.
+- Nothing else changes: Standard (all edge modes), SNES, and HQ with Pixel/Mjuka/SS+palett are pixel-identical to v13.1.
+- The Info overlay shows `internal -> screen AA`. The cost is 2 screen-sized rgb10a2 textures (8 bytes per screen pixel, 45 MB at 2940x1912) plus the larger ray budget.
 
 # Mode7craft v13.1
 

@@ -422,16 +422,22 @@ fn water(d: vec3f, p: vec3f, sh: f32, dark: bool) -> WR {
 }
 fn sky(d: vec3f) -> vec3f { return mix(FOG, vec3f(0.55, 0.72, 0.92), clamp(d.z * 3., 0., 1.)); }
 
-@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f { return shade(fc); }
+// v13.2 HQ anti-aliasing (HQ + Skarpa): U[21].z > 1 = on, ray jitter (U[21].z - 2, U[21].w) in internal pixels;
+// alpha = hit distance (ZT) for the temporal resolve's reprojection. Off (Standard, other modes): fc.xy unchanged.
+var<private> ZT: f32 = 6e4;
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  var c = shade(fc); if (HQ) { if (U[21].z > 1.) { c.a = ZT; } } return c;
+}
 fn shade(fc: vec4f) -> vec4f {
-  let res = U[0].xy; let uv = fc.xy / res * 2. - 1.;
+  var sp = fc.xy; if (HQ) { if (U[21].z > 1.) { sp += U[21].zw - vec2f(2., 0.); } }
+  let res = U[0].xy; let uv = sp / res * 2. - 1.;
   let nd = vec2f(uv.x * U[3].w, -uv.y) * U[0].w;
   let o = U[1].xyz; let F = U[2].xyz; let R = U[3].xyz; let Up = U[4].xyz;
   let d = normalize(F + R * nd.x + Up * nd.y);
   let far = U[2].w; let fogOn = U[1].w;
   let fps = U[7].x > 0.5; let up = d.z > 0.;
   // ---- clouds: stacked blob slices (walked top-down, or bottom-up when looking up) ----
-  var cc = vec3f(1.); var ca = 0.; var ct = 0.;
+  var cc = vec3f(1.); var ca = 0.; var ct = 0.; var tA = 0.; var tT = 0.; var tC = cc;
   if (abs(d.z) > 1e-4) {
   for (var k = 0; k < 10; k++) {
     let j = select(9 - k, k, up); let z = CB + f32(select(j + 1, j, up)) / S; let t = (z - o.z) / d.z;
@@ -458,14 +464,16 @@ fn shade(fc: vec4f) -> vec4f {
         if (hit) { a = 0.5; }
         a = min(a, ceil(smoothstep(0.1, 0.45, t / length(pc - o)) * 4.) / 4.);
       }
-      if (bayer4(vec2i(floor(fc.xy / max(U[9].w, 1.)))) < a) { ca = 1.; ct = t; }   // dither cells stay art-pixel sized
+      // HQ anti-aliasing: a see-through cloud is blended over what lies behind it instead of dithered (no ghosting)
+      if (HQ && U[21].z > 1. && a < 1.) { if (a > 0.) { tA = a; tT = t; tC = cc; } }
+      else if (bayer4(vec2i(floor(fc.xy / max(U[9].w, 1.)))) < a) { ca = 1.; ct = t; }   // dither cells stay art-pixel sized
       break;
     }
   }
   }
   let cloudCol = mix(cc, sky(d), fogOn * smoothstep(far * U[21].x, far, ct));
   // camera above the cloud layer: nothing can be in front of a cloud hit
-  if (ca > 0.5 && o.z > CB + 1.3) { if (HQ) { return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
+  if (ca > 0.5 && o.z > CB + 1.3) { if (HQ) { ZT = ct; return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
   // ---- terrain: exact DDA through the block grid, then the avatar ----
   let tw = select(1e9, (ZW - o.z) / d.z, d.z < 0.);
   let tEnd = select(min(far, tw), min(ct, tw), ca > 0.5);
@@ -490,7 +498,7 @@ fn shade(fc: vec4f) -> vec4f {
     if (r.x <= r.y && r.x > 0. && r.x < hb.t) { hb.t = r.x; hb.id = 8u; hb.n = tn; part = false; }
   }
   var col: vec3f; var tt = hb.t; var gid = 251.;   // surface id (sky 251, water 250, planes 0..239, avatar 253)
-  if (hb.id == 0u && ca > 0.5 && ct < tw) { if (HQ) { return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
+  if (hb.id == 0u && ca > 0.5 && ct < tw) { if (HQ) { ZT = ct; return vec4f(hqCloud(cc, ct, o, d), 1.); } return vec4f(cloudCol, 1.); }
   if (hb.id == 0u) {
     if (tw > far) { col = sky(d); tt = 0.; if (HQ) { col = hqSky(d); tt = far; } }
     else {
@@ -548,7 +556,12 @@ fn shade(fc: vec4f) -> vec4f {
     }
   }
   let ga = select(1., gid / 255., U[9].w < 0.);
-  if (HQ) { return vec4f(hqAtmo(o, d, tt, far, fogOn, col, fc.xy), ga); }
+  if (HQ) {
+    if (gid != 251.) { ZT = tt; }
+    var hc = hqAtmo(o, d, tt, far, fogOn, col, fc.xy);
+    if (tA > 0. && (gid == 251. || tT < tt)) { hc = mix(hc, hqCloud(tC, tT, o, d), tA); }
+    return vec4f(hc, ga);
+  }
   col = mix(col, sky(d), fogOn * smoothstep(far * U[21].x, far, tt));
   return vec4f(col, ga);
 }

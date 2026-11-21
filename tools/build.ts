@@ -19,10 +19,8 @@ const wgsl = (f: string) => readFileSync(root + 'web/' + f, 'utf8').replace(/\/\
 const js = readFileSync(root + 'web/main.js', 'utf8').replace(/^\s*\/\/[^\n]*$/gm, '').replace(/\n\s+/g, '\n');
 const html = readFileSync(root + 'web/index.html', 'utf8').replace('/*SCENE*/', () => wgsl('scene.wgsl')).replace('/*BLIT*/', () => wgsl('blit.wgsl')).replace('/*HQ*/', () => wgsl('hq.wgsl')).replace('/*MAIN*/', () => js).replace(/>\n</g, '><');
 writeFileSync(root + 'dist/index.html', html);
-const stack = readFileSync(root + 'web/stack.js', 'utf8').replace('/*STACK*/', () => wgsl('stack.wgsl')).replace(/^\s*\/\/[^\n]*$/gm, '').replace(/\n\s+/g, '\n');
-writeFileSync(root + 'dist/stack.js', stack);
 let gz = 0, br = 0;
-for (const f of ['index.html', 'g.wasm', 'stack.js']) {
+for (const f of ['index.html', 'g.wasm']) {
   const b = readFileSync(root + 'dist/' + f);
   const g = gzipSync(b, { level: 9 }), r = brotliCompressSync(b, { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } });
   writeFileSync(root + 'dist/' + f + '.gz', g); writeFileSync(root + 'dist/' + f + '.br', r);

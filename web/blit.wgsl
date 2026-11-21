@@ -11,6 +11,14 @@ fn sim(a: vec4f, b: vec4f) -> bool { let e = abs(a - b); return e.a < 0.002 && e
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let ip = vec2i(fc.xy / B.x); var c = textureLoad(src, ip, 0);
   let fl = u32(B.w);
+  if ((fl & 4u) != 0u) {
+    // v13.2 HQ anti-aliasing output (native res): light contrast-limited sharpening of the resolved image
+    let m = vec2i(textureDimensions(src)) - 1;
+    let n = textureLoad(src, clamp(ip - vec2i(0, 1), vec2i(0), m), 0).rgb; let s = textureLoad(src, clamp(ip + vec2i(0, 1), vec2i(0), m), 0).rgb;
+    let w = textureLoad(src, clamp(ip - vec2i(1, 0), vec2i(0), m), 0).rgb; let e = textureLoad(src, clamp(ip + vec2i(1, 0), vec2i(0), m), 0).rgb;
+    let lo = min(min(n, s), min(w, e)); let hi = max(max(n, s), max(w, e));
+    c = vec4f(clamp(c.rgb + (c.rgb * 4. - n - s - w - e) * 0.18, min(lo, c.rgb), max(hi, c.rgb)), 1.);
+  }
   if ((fl & 1u) != 0u) {
     // 'Mjuka kanter': Scale2x-style corner rule on the internal pixels, with an anti-aliased 45-degree
     // cut instead of a hard quadrant, so staircases turn into smooth diagonals (5 loads, no blur on flat areas)
