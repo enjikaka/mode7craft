@@ -74,10 +74,21 @@ fn palQ(c: vec3f, cell: vec2i, dit: bool) -> vec3f {
     if (hr >= 0 && hr < dims.y) { fc3 = vec3f(0.); for (var k = 0; k < 4; k++) { fc3 += textureLoad(src, vec2i(dims.x * (2 * k + 1) / 8, hr), 0).rgb * 0.25; } }
     c = mix(c, fc3, f * Q[2].z);
   } else {
-    // SS: 2x2 internal pixels per output pixel, box-filtered, then snapped (clean edges, no shimmer)
-    cell = vec2i(floor(fc.xy / (B.x * 2.))); let b = cell * 2; gd = dims / 2;
-    c = (textureLoad(src, min(b, m), 0).rgb + textureLoad(src, min(b + vec2i(1, 0), m), 0).rgb
-       + textureLoad(src, min(b + vec2i(0, 1), m), 0).rgb + textureLoad(src, min(b + vec2i(1, 1), m), 0).rgb) * 0.25;
+    // SS: 2x2 rays per output pixel. Flat areas: the mean (stable shading). Where the 4 differ (edges, texel
+    // borders): the medoid, the sample closest to the other three, so the pixel takes the majority colour
+    // instead of a blurred mix (v13 used the mean everywhere, which looked soft)
+    let b = vec2i(floor(fc.xy / (B.x * 2.))) * 2;
+    let s0 = textureLoad(src, min(b, m), 0).rgb; let s1 = textureLoad(src, min(b + vec2i(1, 0), m), 0).rgb;
+    let s2 = textureLoad(src, min(b + vec2i(0, 1), m), 0).rgb; let s3 = textureLoad(src, min(b + vec2i(1, 1), m), 0).rgb;
+    let d01 = dot(s0 - s1, s0 - s1); let d02 = dot(s0 - s2, s0 - s2); let d03 = dot(s0 - s3, s0 - s3);
+    let d12 = dot(s1 - s2, s1 - s2); let d13 = dot(s1 - s3, s1 - s3); let d23 = dot(s2 - s3, s2 - s3);
+    c = (s0 + s1 + s2 + s3) * 0.25;
+    if (max(max(max(d01, d02), max(d03, d12)), max(d13, d23)) > 0.004) {
+      let t = vec4f(d01 + d02 + d03, d01 + d12 + d13, d02 + d12 + d23, d03 + d13 + d23); let mn = min(min(t.x, t.y), min(t.z, t.w));
+      c = select(select(select(s3, s2, t.z == mn), s1, t.y == mn), s0, t.x == mn);
+    }
+    // crosshair and dither cells stay classic-pixel sized (art)
+    let z = max(B.z, 1.); cell = vec2i(floor(fc.xy / (B.x * z))); gd = vec2i(vec2f(dims) / z);
   }
   c = palQ(c, cell, Q[0].w > 0.5);
   if (B.y > 0.5) {

@@ -1,6 +1,13 @@
-# Mode7craft v13
+# Mode7craft v13.1
 
 ![Mode7craft](docs/screenshot.png)
+
+- SS+palett was soft: its output grid was the classic Pixel grid (4 screen px per pixel at 1280x720 HQ) and every output pixel was the plain mean of its 2x2 rays, which blended texel borders into mush. Now the output pixel is a whole number of screen pixels (1 = native) picked from Skarpa's budget (1M Standard / 500k HQ rays, starts at 60%, dynamic resolution as before), upscaled with nearest only, and the resolve takes the mean only where the 4 rays agree; where they differ it takes the medoid (the ray closest to the other three), so edges and texels stay hard. Crosshair and dither cells stay classic-pixel sized.
+- Grafik row is now SNES / Standard / HQ (`m7c-fx` = `s` / `0` / `1`). The separate SNES-läge row is gone; old `m7c-snes=1` is migrated and `?snes=1` still works. SNES sets Standard lighting, Kanter Pixel, Löv Block, Sikt Normal, Dither Av and greys out those rows (and Tid); going back to Standard/HQ restores your own choices.
+- Info row (`?info=1`, `m7c-info`): small top-left overlay in nametag-style pixel text with FPS, frame ms, CPU ms (frame logic), GPU ms (timestamp queries, shown only if the device supports them), GPU memory (`m7.gpuMem().total`) and internal resolution, updated 4x per second. Nothing is measured while it is off. FPS is capped by the display refresh (requestAnimationFrame), so read the ms values for headroom.
+- `DSF=3 node tools/shot.ts URL out.png 390 844` emulates a 3x phone screen.
+
+# Mode7craft v13
 
 v13 adds two looks, both ending in the same palette snap: colours are cut to 15 bits (5-5-5, like the SNES) and looked up in a 32x32x32 table (a 1024x32 rgba8 texture, 128 KB) that holds the nearest of 256 palette colours (23 block/sky/sunset/skin colours x 11 shades, darker shades shifted blue like the game's shadows, plus black/grey/white; red-mean weighted RGB). The GPU builds the table once (`fp` in `web/blit.wgsl`), only when one of the two modes is first used; the default look allocates nothing new and is pixel-identical to v12.
 - Kanter `SS+palett` (`?edge=3`): rays at 2x2 per output pixel (budget 4x Pixel: 460k Standard / 280k HQ internal pixels, dynamic resolution as before), box-filtered to the output grid and snapped to the palette (`fq` in `web/blit.wgsl`). Clean edges without shimmer (idea from @anxuanng).

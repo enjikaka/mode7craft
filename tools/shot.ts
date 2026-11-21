@@ -18,7 +18,7 @@ let id = 0; const pend = new Map<number, (v: any) => void>();
 ws.onmessage = (m) => { const d = JSON.parse(m.data as string); if (d.id && pend.has(d.id)) { pend.get(d.id)!(d.result ?? d.error); pend.delete(d.id); } else if (d.method === 'Runtime.consoleAPICalled') console.log('console:', d.params.args.map((a: any) => a.value ?? a.description).join(' ')); else if (d.method === 'Runtime.exceptionThrown') console.log('EXC:', JSON.stringify(d.params.exceptionDetails).slice(0, 500)); };
 const cmd = (method: string, params: any = {}) => new Promise<any>((r) => { const i = ++id; pend.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });
 await cmd('Runtime.enable'); await cmd('Network.enable'); await cmd('Network.setCacheDisabled', { cacheDisabled: true });
-await cmd('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: false });
+await cmd('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: Number(process.env.DSF ?? 1), mobile: !!process.env.DSF });
 // FREEZE=1: fixed clock (rAF timestamps + performance.now) for deterministic, diffable frames
 if (process.env.DL) await cmd('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: process.env.DL });
 if (process.env.FREEZE) await cmd('Page.enable'), await cmd('Page.addScriptToEvaluateOnNewDocument', { source: `{const T=1000;performance.now=()=>T;const r=requestAnimationFrame.bind(window);window.requestAnimationFrame=(cb)=>r(()=>cb(T));}` });
